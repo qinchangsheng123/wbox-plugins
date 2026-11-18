@@ -1,0 +1,107 @@
+{
+  "id": "desktop_hud",
+  "name": "桌面监控",
+  "version": "1.5.1",
+  "api": 1,
+  "icon": "pulse",
+  "order": 60,
+  "home": true,
+  "builtin": false,
+  "toggle": [
+    "desktop_hud_enabled"
+  ],
+  "entry": "plugin.py:Plugin",
+  "requires_admin": false,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch"
+  ],
+  "tip": "桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用，可选频率。\n右键菜单逐项开关 / 换角 / 鼠标穿透；桌面常驻、不遮挡其他窗口，进入游戏停止监控、退出恢复。改动立即生效。",
+  "config": {
+    "keys": [
+      "desktop_hud_enabled",
+      "desktop_hud"
+    ]
+  },
+  "description": "桌面硬件占用悬浮窗（CPU/GPU/显存/内存 + 可选频率，逐项显示开关）",
+  "settings": [
+    {
+      "key": "desktop_hud.show_cpu",
+      "type": "bool",
+      "label": "处理器占用"
+    },
+    {
+      "key": "desktop_hud.show_gpu",
+      "type": "bool",
+      "label": "显卡占用"
+    },
+    {
+      "key": "desktop_hud.show_vram",
+      "type": "bool",
+      "label": "显存占用"
+    },
+    {
+      "key": "desktop_hud.show_ram",
+      "type": "bool",
+      "label": "内存占用"
+    },
+    {
+      "key": "desktop_hud.show_cpu_freq",
+      "type": "bool",
+      "label": "处理器频率"
+    },
+    {
+      "key": "desktop_hud.show_gpu_freq",
+      "type": "bool",
+      "label": "显卡频率"
+    },
+    {
+      "key": "desktop_hud.hide_in_game",
+      "type": "bool",
+      "label": "游戏中自动隐藏",
+      "hint": "避免悬浮窗挡住游戏画面"
+    },
+    {
+      "key": "desktop_hud.pause_in_game",
+      "type": "bool",
+      "label": "游戏中停止监控",
+      "hint": "游戏里已有其他监控软件时避免重复：会话中停采样并隐藏，退出游戏自动恢复。比「自动隐藏」更省（隐藏只藏窗口、采样继续）"
+    },
+    {
+      "key": "desktop_hud.desktop_only",
+      "type": "bool",
+      "label": "桌面常驻模式",
+      "hint": "平时常驻桌面，其他窗口未最大化时在空隙可见、但绝不遮挡窗口；进入游戏自动隐藏。关闭则始终置顶"
+    },
+    {
+      "key": "desktop_hud.click_through",
+      "type": "bool",
+      "label": "鼠标可穿透",
+      "hint": "打开后点悬浮窗等于点桌面，不会挡住下面的窗口"
+    },
+    {
+      "key": "desktop_hud.position",
+      "type": "choice",
+      "label": "显示位置",
+      "options": [
+        {
+          "value": "top-right",
+          "label": "右上"
+        },
+        {
+          "value": "top-left",
+          "label": "左上"
+        },
+        {
+          "value": "bottom-right",
+          "label": "右下"
+        },
+        {
+          "value": "bottom-left",
+          "label": "左下"
+        }
+      ]
+    }
+  ]
+}

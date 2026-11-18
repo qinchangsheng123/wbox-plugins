@@ -1,0 +1,63 @@
+{
+  "id": "afterburner",
+  "name": "小飞机联动",
+  "version": "2.1.1",
+  "api": 1,
+  "icon": "plane",
+  "order": 10,
+  "home": true,
+  "toggle": [
+    "afterburner_enabled"
+  ],
+  "entry": "plugin.py:Plugin",
+  "requires_admin": false,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch",
+    "process.kill",
+    "shell.run"
+  ],
+  "tip": "游戏启动时自动打开 MSI Afterburner，退出游戏后一并关闭。\n改动立即生效。",
+  "config": {
+    "keys": [
+      "afterburner_path",
+      "afterburner_enabled",
+      "rtss_processes",
+      "manage_rtss",
+      "force_close",
+      "close_wait_sec"
+    ]
+  },
+  "description": "游戏 ↔ MSI Afterburner / RTSS 联动",
+  "settings": [
+    {
+      "key": "afterburner_path",
+      "type": "path",
+      "label": "小飞机程序",
+      "hint": "留空则自动查找已装好的 MSI Afterburner"
+    },
+    {
+      "key": "manage_rtss",
+      "type": "bool",
+      "label": "一并管理帧率组件",
+      "hint": "退出游戏时连同 RTSS 与录制组件一起收起"
+    },
+    {
+      "key": "force_close",
+      "type": "bool",
+      "label": "关不掉时强制结束",
+      "hint": "先正常请求退出，没反应再结束进程"
+    },
+    {
+      "key": "close_wait_sec",
+      "type": "int",
+      "label": "退出后等待",
+      "min": 3,
+      "max": 30,
+      "step": 1,
+      "unit": "秒",
+      "hint": "游戏结束后等这么久才开始关闭，避免误伤还在收尾的程序"
+    }
+  ]
+}

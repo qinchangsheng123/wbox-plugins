@@ -1,0 +1,57 @@
+{
+  "id": "popup",
+  "name": "弹窗拦截",
+  "version": "2.0.1",
+  "api": 1,
+  "icon": "block",
+  "order": 30,
+  "home": true,
+  "toggle": [
+    "popup_guard.enabled"
+  ],
+  "entry": "plugin.py:Plugin",
+  "requires_admin": false,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch",
+    "window.close"
+  ],
+  "tip": "退出游戏后自动关掉弹出的直播窗口，并清理残留的后台程序，避免常驻。",
+  "config": {
+    "keys": [
+      "popup_guard"
+    ]
+  },
+  "description": "会话中提前关窗口 + 退出后清宿主进程树",
+  "settings": [
+    {
+      "key": "popup_guard.early_close_enabled",
+      "type": "bool",
+      "label": "游戏中提前关窗",
+      "hint": "弹窗一露头就关，不等游戏退干净"
+    },
+    {
+      "key": "popup_guard.kill_tree",
+      "type": "bool",
+      "label": "退出后清理后台",
+      "hint": "游戏结束后把弹窗宿主和它拉起的子程序一起收掉"
+    },
+    {
+      "key": "popup_guard.watch_sec",
+      "type": "int",
+      "label": "退出后继续监视",
+      "min": 30,
+      "max": 300,
+      "step": 10,
+      "unit": "秒",
+      "hint": "游戏退出后这段时间里新冒出来的窗口也会被关掉"
+    },
+    {
+      "key": "popup_guard.log_all_new",
+      "type": "bool",
+      "label": "记录所有新窗口",
+      "hint": "排查漏拦时打开，平时关着以免记录过多"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# 源码统一 LF：插件包要在 Windows / Linux 上都能打出同样的字节
+* text=auto eol=lf
+*.zip binary
+*.png binary
+*.ico binary

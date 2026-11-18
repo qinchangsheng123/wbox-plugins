@@ -1,0 +1,55 @@
+{
+  "id": "ace",
+  "name": "ACE 防护",
+  "version": "2.1.1",
+  "api": 1,
+  "icon": "shield",
+  "order": 20,
+  "home": true,
+  "toggle": [
+    "ace_cleanup.enabled",
+    "ace_throttle.enabled"
+  ],
+  "entry": "plugin.py:Plugin",
+  "requires_admin": true,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch",
+    "process.priority",
+    "process.kill",
+    "shell.run"
+  ],
+  "tip": "游戏运行中降低反作弊程序对电脑资源的占用，退出游戏后自动恢复。\n需要管理员权限。",
+  "config": {
+    "keys": [
+      "ace_cleanup",
+      "ace_throttle"
+    ]
+  },
+  "description": "游戏期间限速 + 退出后清理 ACE 残留",
+  "settings": [
+    {
+      "key": "ace_throttle.enabled",
+      "type": "bool",
+      "label": "游戏期间降低占用",
+      "hint": "把反作弊程序压到最低优先级，减少抢处理器"
+    },
+    {
+      "key": "ace_cleanup.enabled",
+      "type": "bool",
+      "label": "退出后清理残留",
+      "hint": "游戏结束一段时间后收拾没退干净的反作弊进程"
+    },
+    {
+      "key": "ace_throttle.delay_sec",
+      "type": "int",
+      "label": "开始前等待",
+      "min": 0,
+      "max": 60,
+      "step": 5,
+      "unit": "秒",
+      "hint": "检测到游戏后等这么久再动手，避免和启动过程抢资源"
+    }
+  ]
+}

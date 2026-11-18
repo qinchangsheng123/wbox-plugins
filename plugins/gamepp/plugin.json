@@ -1,0 +1,49 @@
+{
+  "id": "gamepp",
+  "name": "游戏加加联动",
+  "version": "1.1.1",
+  "api": 1,
+  "icon": "pulse",
+  "order": 15,
+  "home": true,
+  "builtin": true,
+  "toggle": [
+    "gamepp.enabled"
+  ],
+  "entry": "plugin.py:Plugin",
+  "requires_admin": false,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch",
+    "process.kill",
+    "shell.run"
+  ],
+  "tip": "游戏启动时自动打开游戏加加，退出后只关掉这次打开的程序。\n改动立即生效。",
+  "config": {
+    "keys": [
+      "gamepp"
+    ]
+  },
+  "description": "游戏 ↔ 游戏加加（GamePP）联动启动 / 退出",
+  "settings": [
+    {
+      "key": "gamepp.path",
+      "type": "path",
+      "label": "游戏加加程序",
+      "hint": "留空则自动查找已装好的游戏加加"
+    },
+    {
+      "key": "gamepp.manage_children",
+      "type": "bool",
+      "label": "一并关闭子程序",
+      "hint": "只关这次游戏拉起来的那一批，不动你自己开的"
+    },
+    {
+      "key": "gamepp.force_close",
+      "type": "bool",
+      "label": "关不掉时强制结束",
+      "hint": "先正常请求退出，没反应再结束进程"
+    }
+  ]
+}
