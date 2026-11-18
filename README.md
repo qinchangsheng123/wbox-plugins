@@ -7,20 +7,33 @@
 
 ## 插件清单
 
-| 插件 | 版本 | 作用 | 需要管理员 |
-|---|---|---|---|
-| `afterburner` 小飞机联动启动 | 2.1.1 | 开游戏自动拉起 MSI Afterburner / RTSS，退出后优雅关闭 | 否 |
-| `ace` ACE 防护 | 2.1.1 | 游戏期间压低反作弊进程的 CPU / 磁盘占用，退出后清理残留 | 是 |
-| `popup` 弹窗关闭 | 2.0.1 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗 | 否 |
-| `gamepp` 游戏加加联动 | 1.1.1 | 开游戏拉起游戏加加，退出后关闭 | 是 |
-| `desktop_hud` 桌面悬浮窗 | 1.5.1 | 桌面上显示帧率 / 占用等指标 | 否 |
+每个插件一个 Release，标签是 `<id>-v<版本>`，资产里是 zip 和 `.sha256`。
+
+| 插件 | 版本 | 作用 | 需要管理员 | 下载 |
+|---|---|---|---|---|
+| `afterburner` 小飞机联动启动 | 2.1.1 | 开游戏自动拉起 MSI Afterburner / RTSS，退出后优雅关闭 | 否 | [zip][r-ab] |
+| `ace` ACE 防护 | 2.1.1 | 游戏期间压低反作弊进程的 CPU / 磁盘占用，退出后清理残留 | 是 | [zip][r-ace] |
+| `popup` 弹窗关闭 | 2.0.1 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗 | 否 | [zip][r-pop] |
+| `gamepp` 游戏加加联动 | 1.1.1 | 开游戏拉起游戏加加，退出后关闭 | 否 | [zip][r-gp] |
+| `desktop_hud` 桌面悬浮窗 | 1.5.1 | 桌面上显示帧率 / 占用等指标 | 否 | [zip][r-hud] |
+
+[r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.1.1
+[r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.1.1
+[r-pop]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/popup-v2.0.1
+[r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.1.1
+[r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.5.1
 
 ## 安装
 
-**方式一：面板安装（推荐）**
+**方式零：从 Releases 下载（推荐给普通用户）**
+
+打开 <https://github.com/qinchangsheng123/wbox-plugins/releases>，按插件名找到对应
+Release，下载 `<id>-v<版本>.zip`（**不要解压**），然后照下面「方式一」装进面板。
+
+**方式一：面板安装**
 
 1. 打开 WBOX 主窗口，点右上角 **＋**；
-2. 选 `dist\<id>-v<版本>.zip`；
+2. 选刚下载的 `<id>-v<版本>.zip`；
 3. 确认框会显示发布者、权限、文件数与整包 SHA-256，确认后立即生效。
 
 **方式二：手动放目录**
@@ -60,4 +73,5 @@ python tools\pack.py --check dist\ace-v2.1.1.zip  :: 只校验
 ## 版本
 
 插件版本独立演进，遵循三段式 `vMAJOR.MINOR.PATCH`；同一插件的旧版本包不保留，
-`dist\` 里永远只有最新版。
+`dist\` 里永远只有最新版，发布到 Releases 的 tag 记作 `<id>-v<版本>`
+（例如 `ace-v2.1.1`），一个插件一个 Release，不打包捆绑。
