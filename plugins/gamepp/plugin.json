@@ -6,7 +6,6 @@
   "icon": "pulse",
   "order": 15,
   "home": true,
-  "builtin": true,
   "toggle": [
     "gamepp.enabled"
   ],
