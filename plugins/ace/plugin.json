@@ -1,7 +1,7 @@
 {
   "id": "ace",
   "name": "ACE 防护",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "api": 1,
   "icon": "shield",
   "order": 20,

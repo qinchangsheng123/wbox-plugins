@@ -104,6 +104,21 @@ def _k32():
         d.CloseHandle.restype = wt.BOOL
         d.LocalFree.argtypes = [ctypes.c_void_p]
         d.LocalFree.restype = ctypes.c_void_p
+        # v2.0.0 进程身份：创建时间 + 映像名，用于关闭前复核 PID 是否被复用
+        d.GetProcessTimes.argtypes = [wt.HANDLE,
+                                      ctypes.POINTER(wt.FILETIME),
+                                      ctypes.POINTER(wt.FILETIME),
+                                      ctypes.POINTER(wt.FILETIME),
+                                      ctypes.POINTER(wt.FILETIME)]
+        d.GetProcessTimes.restype = wt.BOOL
+        d.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD,
+                                                 wt.LPWSTR,
+                                                 ctypes.POINTER(wt.DWORD)]
+        d.QueryFullProcessImageNameW.restype = wt.BOOL
+        d.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+        d.TerminateProcess.restype = wt.BOOL
+        d.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+        d.WaitForSingleObject.restype = wt.DWORD
         _kernel32 = d
     return _kernel32
 
@@ -203,14 +218,111 @@ _WAIT_TIMEOUT = 0x00000102
 _MAX_HANDLES = 64       # WaitForMultipleObjects 的硬上限
 
 
-def _open_sync(pid):
-    """拿 SYNCHRONIZE 句柄用于等待退出；拿不到（受保护进程等）返回 None，
-    调用方回落到进程表轮询。"""
+def _has_exited(handle):
+    """句柄是否已 signaled（进程已退出）。拿不到结果按"未退出"处理。"""
     try:
-        h = _k32().OpenProcess(_SYNCHRONIZE, False, int(pid))
+        return _k32().WaitForSingleObject(handle, 0) == _WAIT_OBJECT_0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- 进程身份
+# v2.0.0：只看「pid 在不在 + 名字对不对」不足以确认身份——进程退出后 PID 会被
+# 系统立刻复用，同名进程（尤其 RTSS / 游戏加加这种会自己重启的）在同一个
+# pid 上重新出现时，按 pid 强杀就会误关"用户后来自己开的那一份"。
+# 这里用**创建时间**（FILETIME 100ns 计数）+ 映像名做稳定身份，并在动手前
+# 复核；同时从打开句柄起 PID 就被钉住（进程未退出前系统不会把这个 PID 再分配）。
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_TERMINATE = 0x0001
+
+
+def _open_proc(pid):
+    """打开用于「等待 + 校验身份 + 结束」的句柄；失败返回 None（受保护进程等）。"""
+    try:
+        h = _k32().OpenProcess(
+            _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION,
+            False, int(pid))
         return h or None
     except Exception:
         return None
+
+
+def _identity_of(handle):
+    """-> (created_ticks, image_basename)；拿不到的那项为 None / ''。"""
+    k32 = _k32()
+    created = None
+    try:
+        c, e, kt, ut = (wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME())
+        if k32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                               ctypes.byref(kt), ctypes.byref(ut)):
+            created = (int(c.dwHighDateTime) << 32) | int(c.dwLowDateTime)
+    except Exception:
+        created = None
+    name = ''
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(len(buf))
+        if k32.QueryFullProcessImageNameW(handle, 0, buf,
+                                          ctypes.byref(size)) and buf.value:
+            name = os.path.basename(buf.value)
+    except Exception:
+        name = ''
+    return created, name
+
+
+def process_identity(pid):
+    """进程身份快照：{'pid','created','created_at','name'}；打不开返回 None。
+
+    `created_at` 是换算后的 time.time() 口径，可直接和"我什么时候启动的"比。
+    受保护进程可能拿不到创建时间（created=None），调用方必须按"未校验"处理。
+    """
+    h = _open_proc(pid)
+    if not h:
+        return None
+    try:
+        created, name = _identity_of(h)
+    finally:
+        try:
+            _k32().CloseHandle(h)
+        except Exception:
+            pass
+    return {'pid': int(pid), 'created': created,
+            'created_at': filetime_to_time(created) if created else None,
+            'name': name}
+
+
+def process_created(pid):
+    """进程创建时刻（time.time 口径）；拿不到返回 None。"""
+    ident = process_identity(pid)
+    return ident['created_at'] if ident else None
+
+
+def filetime_to_time(ticks):
+    """FILETIME(100ns since 1601) -> Unix 秒。"""
+    if not ticks:
+        return None
+    try:
+        return (int(ticks) - 116444736000000000) / 10000000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_process(pid, name, created):
+    """复核 pid 现在还是不是当初那个进程。返回 (ok, detail)。
+
+    created 为 None 表示当初就没拿到创建时间：只能比名字，按"不可强杀"处理
+    （调用方用返回的 detail 区分「确认同一进程」与「仅名字相同」）。
+    """
+    ident = process_identity(pid)
+    if ident is None:
+        return False, '进程已退出或无法打开'
+    if ident['name'] and name and ident['name'].lower() != name.lower():
+        return False, 'pid 现在是 %s' % ident['name']
+    if created is None or ident['created'] is None:
+        return False, '创建时间不可用（仅名字相同）'
+    if int(ident['created']) != int(created):
+        return False, '创建时间已变（pid 被复用）'
+    return True, ''
 
 
 def close_processes(ctx, core, targets, close_wait, force_close):
@@ -238,8 +350,9 @@ def close_processes(ctx, core, targets, close_wait, force_close):
         ctx.log('取进程表失败，本轮不处理 %d 个关闭目标' % len(targets))
         return dict((pid, 'unknown') for pid, _n in targets)
 
-    live = []       # [pid, name, handle]
+    live = []       # [pid, name, handle, created, verified]
     opened = []     # 所有开过的句柄，finally 里统一释放（含已退出目标的）
+    k32 = _k32()
     for pid, name in targets:
         cur = procs.get(pid)
         if cur is None:
@@ -249,13 +362,30 @@ def close_processes(ctx, core, targets, close_wait, force_close):
             ctx.log('pid %d 已不是 %s（%s），跳过' % (pid, name, cur))
             result[pid] = 'skipped'
             continue
-        core.run_hidden([core.TASKKILL, '/PID', str(pid)])
-        h = _open_sync(pid)
+        # 先拿句柄再发关闭请求：句柄一开，PID 在进程退出前不会被复用，
+        # 后面整套等待/强杀都钉在这一个进程对象上，而不是一个可能被重发的号。
+        h = _open_proc(pid)
+        created, real = (None, '')
+        if h:
+            created, real = _identity_of(h)
+            if real and real.lower() != name.lower():
+                ctx.log('pid %d 现在是 %s（期望 %s），判定 PID 复用，跳过'
+                        % (pid, real, name))
+                result[pid] = 'reused'
+                try:
+                    k32.CloseHandle(h)
+                except Exception:
+                    pass
+                continue
+        verified = created is not None
+        if not verified:
+            ctx.log('pid %d（%s）拿不到创建时间，只请求退出、不强制结束'
+                    % (pid, name))
         if h:
             opened.append(h)
-        live.append([pid, name, h])
+        core.run_hidden([core.TASKKILL, '/PID', str(pid)])
+        live.append([pid, name, h, created, verified])
 
-    k32 = _k32()
     deadline = time.time() + max(0.0, float(close_wait))
     try:
         while live:
@@ -283,13 +413,13 @@ def close_processes(ctx, core, targets, close_wait, force_close):
             now_procs = ctx.snapshot()
             if now_procs is None:
                 ctx.log('取进程表失败，停止等待剩余 %d 个进程' % len(live))
-                for pid, _n, _h in live:
+                for pid, _n, _h, _c, _v in live:
                     result[pid] = 'unknown'
                 live = []
                 break
             if ctx.games_present(now_procs):
                 ctx.log('关闭等待中检测到游戏回归，中止关闭（剩余 %d 个）' % len(live))
-                for pid, _n, _h in live:
+                for pid, _n, _h, _c, _v in live:
                     result[pid] = 'aborted'
                 live = []
                 break
@@ -300,18 +430,43 @@ def close_processes(ctx, core, targets, close_wait, force_close):
                     result[item[0]] = 'exited'
                     live.remove(item)
                 elif cur != item[1]:
-                    ctx.log('pid %d 已被复用，停止处理' % item[0])
+                    ctx.log('pid %d 已被复用（现在是 %s），停止处理'
+                            % (item[0], cur))
                     result[item[0]] = 'reused'
                     live.remove(item)
-        for pid, name, _h in live:
-            if force_close:
-                core.run_hidden([core.TASKKILL, '/PID', str(pid), '/F'])
-                ctx.log('WM_CLOSE 未退出（通常是关闭到托盘），按配置结束 %s (pid %d)'
+        for pid, name, h, created, verified in live:
+            if h and _has_exited(h):
+                ctx.log('已退出 %s (pid %d)' % (name, pid))
+                result[pid] = 'exited'
+                continue
+            if not force_close:
+                ctx.log('%s (pid %d) 未退出，按配置不强制' % (name, pid))
+                result[pid] = 'left'
+                continue
+            # 强杀前最后一次确认身份：创建时间对不上就是另一个进程，宁可漏关。
+            ok, why = (False, '无句柄')
+            if h:
+                ok, why = _same_process(pid, name, created)
+            if not ok:
+                ctx.log('%s (pid %d) 未退出，但身份未确认（%s），不强制结束'
+                        % (name, pid, why))
+                result[pid] = 'left'
+                continue
+            # 有校验过的句柄就走 TerminateProcess：句柄钉住了进程对象，
+            # 不存在"taskkill 时 PID 已经换成别人"的窗口。
+            try:
+                killed = bool(k32.TerminateProcess(h, 1))
+            except Exception:
+                killed = False
+            if killed:
+                ctx.log('WM_CLOSE 未退出（通常是关闭到托盘），已强制结束 %s (pid %d)'
                         % (name, pid))
                 result[pid] = 'forced'
             else:
-                ctx.log('%s (pid %d) 未退出，按配置不强制' % (name, pid))
-                result[pid] = 'left'
+                core.run_hidden([core.TASKKILL, '/PID', str(pid), '/F'])
+                ctx.log('WM_CLOSE 未退出，TerminateProcess 未成功，改用 taskkill 结束 '
+                        '%s (pid %d)' % (name, pid))
+                result[pid] = 'forced'
     finally:
         for h in opened:
             try:

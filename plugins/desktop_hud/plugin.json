@@ -1,7 +1,7 @@
 {
   "id": "desktop_hud",
   "name": "桌面监控",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "api": 1,
   "icon": "pulse",
   "order": 60,

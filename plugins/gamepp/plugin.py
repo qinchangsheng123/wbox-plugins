@@ -35,6 +35,8 @@ class Plugin(WingmanPlugin):
             'manage_children': True,
             'force_close': True,
             'close_wait_sec': 6.0,
+            # 退出后先等这么多秒再关（0 = 立即）。倒计时期间回到游戏会自动取消。
+            'close_delay_sec': 0,
         }
     }
 
@@ -48,14 +50,22 @@ class Plugin(WingmanPlugin):
         self.close_wait = 6.0
         self.owned_pid = None
         self.owned_by_name = False       # UAC 提权启动拿不到 pid 时按进程名关
+        # v2.0.0 身份：pid 会被系统复用，关闭前要用创建时刻确认还是当初那一个
+        self.owned_created = None
+        self.launch_at = 0.0
+        self.close_at = 0.0              # 关闭倒计时截止时刻
+        self.last_close = {}
         self.pending_close = False       # 本局是否真的接管过（没拉起就不用重试关闭）
         self.baseline = set()            # 本局开始前就在跑的 GamePP 家族 pid
+        self.baseline_since = 0.0        # 本局起点（基线 pid 被复用后不再算基线）
+        self.close_delay = 0.0
         self.next_launch = 0.0
         self.start_seq = -1
         self.close_noted = False
         self.acl_checked = set()
         self._core_mod = None
         self._detected = ''
+        self._source = ''                # 最近一次路径来自哪里（配置/目录/注册表/进程）
         self._next_probe = 0.0           # 注册表全量枚举的负缓存到期时刻
 
     # ---------------------------------------------------------------- 内部
@@ -79,10 +89,15 @@ class Plugin(WingmanPlugin):
         self.manage_children = bool(seg.get('manage_children', True))
         self.force_close = bool(seg.get('force_close', True))
         try:
+            self.close_delay = max(0.0, min(60.0, float(seg.get('close_delay_sec', 0))))
+        except (TypeError, ValueError):
+            self.close_delay = 0.0
+        try:
             self.close_wait = max(0.5, float(seg.get('close_wait_sec', 6)))
         except (TypeError, ValueError):
             self.close_wait = 6.0
         self._detected = ''              # 配置改了就重新探测路径
+        self._source = ''
         self._next_probe = 0.0           # 负缓存一并作废
 
     # ---------------------------------------------------------------- 会话
@@ -90,15 +105,18 @@ class Plugin(WingmanPlugin):
         procs = tick.procs or {}
         self.start_seq = tick.seq
         self.baseline = self._family_pids(procs)
+        self.baseline_since = tick.now
+        self.close_at = 0.0
         running = MAIN_NAME in tick.names
-        ours = ((self.owned_pid is not None and self.owned_pid in procs
-                 and procs[self.owned_pid] == MAIN_NAME) or self.owned_by_name)
+        ours = (self._owns_pid(procs) or self.owned_by_name)
         if running and ours:
             self.pending_close = True
             self.ctx.log('游戏加加仍在运行（本插件上一轮拉起），继续接管')
         elif running:
             self.owned_pid = None
             self.owned_by_name = False
+            self.owned_created = None
+            self.launch_at = 0.0
             self.pending_close = False
             self.ctx.log('游戏加加已在运行（非本插件启动），本次不接管，退出时不关闭')
         elif tick.now >= self.next_launch:
@@ -110,6 +128,9 @@ class Plugin(WingmanPlugin):
                 self.ctx.log('游戏加加联动已关闭（设置面板），跳过启动')
 
     def on_session_resume(self, tick):
+        if self.close_at:
+            self.close_at = 0.0
+            self.ctx.log('取消关闭倒计时：游戏已回到前台，游戏加加保持运行')
         self.ctx.log('游戏进程在宽限期内恢复，沿用当前会话与游戏加加')
 
     def on_session_close(self, tick):
@@ -125,6 +146,13 @@ class Plugin(WingmanPlugin):
                 self.close_noted = True
             return
         self.close_noted = False
+        now = getattr(tick, 'now', time.time())
+        if self.close_delay > 0 and now >= self.close_at:
+            self.close_at = now + self.close_delay
+            self.ctx.retry_close(self.close_delay)
+            self.ctx.log('游戏已退出，%d 秒后关闭游戏加加（现在重新打开游戏可取消）'
+                         % int(self.close_delay))
+            return
         self.close_owned(procs)
         self.pending_close = False
 
@@ -135,6 +163,8 @@ class Plugin(WingmanPlugin):
             self.ctx.log('本插件拉起的游戏加加中途退出，本次不再自动拉起')
             self.owned_pid = None
             self.owned_by_name = False
+            self.owned_created = None
+            self.launch_at = 0.0
 
     # ---------------------------------------------------------------- 关闭
     def close_owned(self, procs):
@@ -142,24 +172,79 @@ class Plugin(WingmanPlugin):
             self.ctx.log('关闭前复核：游戏进程已回来，放弃本轮关闭游戏加加')
             return
         targets = []
-        if self.owned_pid is not None and procs.get(self.owned_pid) == MAIN_NAME:
-            targets.append((self.owned_pid, MAIN_NAME))
+        if self.owned_pid is not None:
+            if self._owns_pid(procs):
+                targets.append((self.owned_pid, MAIN_NAME))
+            else:
+                self.ctx.log('pid %d 已不是当初拉起的游戏加加（身份不符），不关闭'
+                             % self.owned_pid)
         elif self.owned_by_name:
+            # 提权启动拿不到 pid：只关本次启动之后出现的同名进程，用户先开的那份不碰
             targets.extend((pid, name) for pid, name in procs.items()
-                           if name == MAIN_NAME and pid not in self.baseline)
+                           if name == MAIN_NAME and pid not in self.baseline
+                           and self._started_by_us(pid))
         if self.manage_children:
             # 主进程排最前：游戏加加的监控/加速组件由它拉起，先关父进程
             extra = [(pid, name) for pid, name in procs.items()
                      if name in self.names and pid not in self.baseline
+                     and self._family_new(pid)
                      and pid not in [t[0] for t in targets]]
             extra.sort(key=lambda item: (item[1] != MAIN_NAME, item[0]))
             targets.extend(extra)
         # v1.1.0：整批先发关闭请求再共享期限等待（主进程仍排最前先收到），
         # 不再逐个各等 close_wait。游戏回归会中止整批。
-        self._close_batch(targets)
+        self.last_close = self._close_batch(targets) or {}
+        self._log_close_result(self.last_close)
         self.owned_pid = None
         self.owned_by_name = False
+        self.owned_created = None
+        self.launch_at = 0.0
+        self.close_at = 0.0
         self.baseline = set()
+
+    # ------------------------------------------------------------ 身份
+    def _owns_pid(self, procs):
+        """pid 现在还是不是本插件当初拉起的那一个（pid + 创建时间双确认）。"""
+        pid = self.owned_pid
+        if pid is None or (procs is not None and procs.get(pid) != MAIN_NAME):
+            return False
+        if not self.owned_created:
+            return True
+        cur = proc_util.process_created(pid)
+        return cur is not None and abs(cur - self.owned_created) < 0.5
+
+    def _started_by_us(self, pid):
+        """按名字接管时用创建时刻判断是否为本次拉起的（拿不到时间就不动）。"""
+        if not self.launch_at:
+            return True
+        created = proc_util.process_created(pid)
+        if created is None:
+            self.ctx.log('pid %d 拿不到创建时间，无法确认是本次拉起的，跳过' % pid)
+            return False
+        return created >= self.launch_at - 2.0
+
+    def _family_new(self, pid):
+        """家族子进程是否本局新出现的（基线 pid 可能已被复用，按创建时刻复核）。"""
+        if not self.baseline_since:
+            return True
+        created = proc_util.process_created(pid)
+        if created is None:
+            return False
+        return created >= self.baseline_since - 2.0
+
+    def _log_close_result(self, results):
+        if not results:
+            return
+        buckets = {}
+        for pid, verdict in results.items():
+            buckets.setdefault(verdict, []).append(pid)
+        self.ctx.log('游戏加加关闭结果：%s'
+                     % '，'.join('%s=%d' % (k, len(v))
+                                for k, v in sorted(buckets.items())))
+        risky = buckets.get('left') or buckets.get('reused')
+        if risky:
+            self.ctx.log('有游戏加加进程未被关闭（pid %s）：多为身份未确认或已在退出中'
+                         % ', '.join(str(p) for p in risky))
 
     def _close_batch(self, targets):
         """批量关闭的唯一入口（也是回归测试的观察点：断言选中了哪些 pid）。"""
@@ -235,9 +320,24 @@ class Plugin(WingmanPlugin):
                     winreg.CloseKey(key)
         return ''
 
+    def detect_source(self):
+        """最近一次路径的来源（自检 / 日志用）：配置 / 已探测 / 常见目录 /
+        注册表卸载项 / 运行中进程。路径为空时返回空串。"""
+        return self._source
+
+    def _hit(self, path, source):
+        """记录命中：路径 + 来源，同一来源只记一次日志。"""
+        if path != self._detected or source != self._source:
+            self.ctx.log('游戏加加路径：%s（来源：%s）' % (path, source))
+        self._detected = path
+        self._source = source
+        return path
+
     def resolve_path(self):
         """配置 -> 缓存的探测结果 -> 常见目录 -> 注册表 -> 运行中进程。"""
         if self.path and os.path.isfile(self.path):
+            if self._source != '配置':
+                self._hit(self.path, '配置')
             return self.path
         if self._detected and os.path.isfile(self._detected):
             return self._detected
@@ -245,9 +345,7 @@ class Plugin(WingmanPlugin):
             base = os.environ.get(var)
             cand = os.path.join(base, 'GamePP', 'GamePP.exe') if base else ''
             if cand and os.path.isfile(cand):
-                self._detected = cand
-                self.ctx.log('自动探测到游戏加加：%s' % cand)
-                return cand
+                return self._hit(cand, '常见安装目录')
         # v1.1.0：注册表枚举加负缓存。没装游戏加加的机器上，原来每局都要
         # HKLM+HKCU × 2 个 Uninstall 子键 × 最多 512 项开键查 DisplayName，
         # 纯浪费。失败后 60 秒内不再全量枚举；on_config 会立刻作废负缓存。
@@ -259,17 +357,13 @@ class Plugin(WingmanPlugin):
             else:
                 self._next_probe = time.time() + 60.0
         if cand:
-            self._detected = cand
-            self.ctx.log('从卸载信息探测到游戏加加：%s' % cand)
-            return cand
+            return self._hit(cand, '注册表卸载项')
         core = self._core()
         for pid, name in (core.snapshot() or {}).items():
             if name == MAIN_NAME:
                 cand = core.process_path(pid)
                 if cand and os.path.isfile(cand):
-                    self._detected = cand
-                    self.ctx.log('从运行中进程探测到游戏加加：%s' % cand)
-                    return cand
+                    return self._hit(cand, '运行中进程')
         return ''
 
     def check_exe_dir(self, path):
@@ -291,18 +385,25 @@ class Plugin(WingmanPlugin):
         core = self._core()
         self.ctx.log('启动游戏加加: %s' % path)
         try:
+            self.launch_at = time.time()
             p = subprocess.Popen([path], cwd=os.path.dirname(path),
                                  creationflags=core.CREATE_NO_WINDOW, close_fds=True)
             self.owned_pid = p.pid
+            self.owned_created = proc_util.process_created(p.pid)
             self.owned_by_name = False
-            self.ctx.log('游戏加加已启动，pid=%d' % p.pid)
+            self.ctx.log('游戏加加已启动，pid=%d%s'
+                         % (p.pid, '' if self.owned_created
+                            else '（创建时间未取到，按 pid+名字认）'))
         except OSError as e:
             if getattr(e, 'winerror', None) == 740:
                 rc = core.shell_execute_runas(path)
                 if rc and rc > 32:
                     self.owned_pid = None
+                    self.owned_created = None
                     self.owned_by_name = True
-                    self.ctx.log('已通过 UAC 提权启动（拿不到 pid，退出时按进程名关闭）')
+                    self.launch_at = time.time()
+                    self.ctx.log('已通过 UAC 提权启动（拿不到 pid，退出时只关本次启动'
+                                 '之后出现的同名进程）')
                 else:
                     self.ctx.log('提权启动失败，ShellExecute 返回 %s' % rc)
                     self.next_launch = time.time() + 60
@@ -320,4 +421,21 @@ class Plugin(WingmanPlugin):
         running = sorted(set(n for n in procs.values() if n in self.names))
         out.append('GamePP running : %s' % (running or 'none'))
         out.append('GamePP path    : %s' % (self.resolve_path() or '未探测到'))
+        out.append('GamePP source  : %s' % (self.detect_source() or '未探测'))
         out.append('GamePP watch   : %d' % len(self.names))
+        if self.owned_pid is not None:
+            ident = proc_util.process_identity(self.owned_pid)
+            out.append('GamePP owned   : pid %d created_at=%s%s'
+                       % (self.owned_pid,
+                          time.strftime('%H:%M:%S',
+                                        time.localtime(ident['created_at']))
+                          if ident and ident.get('created_at') else '-',
+                          '' if ident else '（进程已退出）'))
+        elif self.owned_by_name:
+            out.append('GamePP owned   : 按名字接管（本次启动之后出现的实例）')
+        else:
+            out.append('GamePP owned   : 无（用户自己启动 / 未接管）')
+        if self.last_close:
+            out.append('GamePP close   : %s'
+                       % '，'.join('%s=%s' % kv for kv in
+                                  sorted(self.last_close.items())))

@@ -33,6 +33,9 @@ class Plugin(WingmanPlugin):
         'manage_rtss': bool(core_defaults.DEFAULTS['manage_rtss']),
         'force_close': bool(core_defaults.DEFAULTS['force_close']),
         'close_wait_sec': core_defaults.DEFAULTS['close_wait_sec'],
+        # 退出后先等这么多秒再关（0 = 立即）。给用户留出"撤销"窗口：
+        # 倒计时期间重新开游戏会走 on_session_resume，关闭动作自然取消。
+        'close_delay_sec': 0,
     }
 
     def __init__(self, ctx):
@@ -40,7 +43,14 @@ class Plugin(WingmanPlugin):
         # ---- 本插件私有状态（v1 的 Guard 字段，全部搬走）----
         self.ab_pid = None
         self.ab_by_name = False
+        # v2.0.0 所有权身份：不只记 pid，同时记创建时刻。pid 会在进程退出后
+        # 被系统复用，只有「pid + 创建时间」才能确认还是当初拉起的那一个。
+        self.ab_created = None
+        self.launch_at = 0.0
+        self.close_at = 0.0          # 可配置的关闭倒计时截止时刻
+        self.last_close = {}         # 最近一次关闭结果 {pid: verdict}
         self.rtss_baseline = set()
+        self.rtss_since = 0.0        # 本局起点：只把此后创建的 RTSS 组件算作"我们拉起的"
         self.next_launch = 0.0
         self.close_noted = False
         self.start_seq = -1          # 本局开局的 tick 序号（开局那一轮不判"中途退出"）
@@ -51,6 +61,7 @@ class Plugin(WingmanPlugin):
         self.manage_rtss = True
         self.force_close = True
         self.close_wait = 6.0
+        self.close_delay = 0.0       # >0 = 退出后先等这么多秒再关（可取消）
         self.acl_checked = set()     # 已做过"目录是否对普通用户可写"检查的目录
         self._core_mod = None
 
@@ -81,10 +92,41 @@ class Plugin(WingmanPlugin):
             self.close_wait = float(cfg.get('close_wait_sec', 6))
         except (TypeError, ValueError):
             self.close_wait = 6.0
+        try:
+            self.close_delay = max(0.0, min(60.0, float(cfg.get('close_delay_sec', 0))))
+        except (TypeError, ValueError):
+            self.close_delay = 0.0
 
     def on_load(self):
         # 启动时不主动探测小飞机（v1 也是等到开游戏才找）：on_load 里做只读检查没有意义
         pass
+
+    # ---------------------------------------------------------------- 所有权
+    def _owns_pid(self, procs, pid):
+        """pid 现在还是不是本插件当初拉起的那一个（pid + 创建时间双确认）。"""
+        if pid is None or (procs is not None and procs.get(pid) != self._ab_name()):
+            return False
+        if not self.ab_created:
+            # 老会话（升级前拉起、没有身份记录）只能按 pid + 名字认，日志里点明
+            return True
+        cur = proc_util.process_created(pid)
+        if cur is None:
+            return False
+        return abs(cur - self.ab_created) < 0.5
+
+    def _started_by_us(self, pid, launch_at):
+        """按名字接管时（UAC 提权拿不到 pid）用创建时刻判断"是不是本次拉起的"。
+
+        早于本次启动的进程属于用户自己开的那一份，绝不关；拿不到创建时间的
+        也一律不动（宁可不关，也不能关错）。
+        """
+        if not launch_at:
+            return True
+        created = proc_util.process_created(pid)
+        if created is None:
+            self.ctx.log('pid %d 拿不到创建时间，无法确认是本次拉起的，跳过' % pid)
+            return False
+        return created >= launch_at - 2.0
 
     # ---------------------------------------------------------------- 会话
     def on_session_start(self, tick):
@@ -98,14 +140,17 @@ class Plugin(WingmanPlugin):
         rtss_pids = set(pid for pid, n in procs.items() if n in rtss)
         # 每局开始重拍 RTSS 基线：只有"本局新出现的" RTSS 组件才归我们关
         self.rtss_baseline = rtss_pids
+        self.rtss_since = tick.now
+        self.close_at = 0.0
         ab_running = ab_name in names
-        ours = ((self.ab_pid is not None and self.ab_pid in procs
-                 and procs[self.ab_pid] == ab_name) or self.ab_by_name)
+        ours = ((self._owns_pid(procs, self.ab_pid)) or self.ab_by_name)
         if ab_running and ours:
             self.ctx.log('小飞机仍在运行（本脚本上一轮启动），继续接管')
         elif ab_running:
             self.ab_pid = None
             self.ab_by_name = False
+            self.ab_created = None
+            self.launch_at = 0.0
             self.ctx.log('小飞机已在运行（非本脚本启动），本次不接管，退出游戏时不会关闭它')
         elif tick.now >= self.next_launch:
             if self.enabled:
@@ -115,6 +160,9 @@ class Plugin(WingmanPlugin):
 
     def on_session_resume(self, tick):
         """grace -> active：只保留所有权，不重启、不重设 RTSS 基线（v1 1168-1170）。"""
+        if self.close_at:
+            self.close_at = 0.0
+            self.ctx.log('取消关闭倒计时：游戏已回到前台，小飞机保持运行')
         self.ctx.log('游戏进程在宽限期内恢复，沿用当前会话与小飞机')
 
     def on_session_close(self, tick):
@@ -129,6 +177,14 @@ class Plugin(WingmanPlugin):
                 self.close_noted = True
             return
         self.close_noted = False
+        # 可配置倒计时：先申请一次延迟，期间回到游戏会自动取消（见 resume）。
+        now = getattr(tick, 'now', time.time())
+        if self.close_delay > 0 and now >= self.close_at:
+            self.close_at = now + self.close_delay
+            self.ctx.retry_close(self.close_delay)
+            self.ctx.log('游戏已退出，%d 秒后关闭小飞机（现在重新打开游戏可取消）'
+                         % int(self.close_delay))
+            return
         self.close_owned(procs)
 
     def on_tick(self, tick):
@@ -141,6 +197,8 @@ class Plugin(WingmanPlugin):
             self.ctx.log('本脚本启动的小飞机中途退出，本次不再自动拉起')
             self.ab_pid = None
             self.ab_by_name = False
+            self.ab_created = None
+            self.launch_at = 0.0
 
     # ---------------------------------------------------------------- 关闭
     def close_owned(self, procs):
@@ -158,18 +216,47 @@ class Plugin(WingmanPlugin):
         if self.ctx.games_present(procs):
             self.ctx.log('关闭前复核：游戏进程已回来，放弃本轮关闭')
             return
+        targets = []
+        # 本局是否接管过（主进程可能已经自己退了，但 RTSS 子组件还挂着：
+        # 这种情况下仍必须清 RTSS，不能因为 targets 为空就跳过）。
+        owned = self.ab_pid is not None or self.ab_by_name
         if self.ab_pid is not None:
-            if self.ab_pid in procs and procs[self.ab_pid] == ab_name:
-                self.close_pid(self.ab_pid, ab_name)
+            if self._owns_pid(procs, self.ab_pid):
+                targets.append((self.ab_pid, ab_name))
+            else:
+                self.ctx.log('pid %d 已不是当初拉起的小飞机（身份不符），不关闭'
+                             % self.ab_pid)
         elif self.ab_by_name:
+            # 提权启动拿不到 pid：只关"本次启动之后才出现"的同名进程。
+            # 用户自己开的那一份创建时间更早，绝不碰。
             for pid, name in list(procs.items()):
-                if name == ab_name:
-                    self.close_pid(pid, ab_name)
-        if self.manage_rtss and (self.ab_pid is not None or self.ab_by_name):
+                if name == ab_name and self._started_by_us(pid, self.launch_at):
+                    targets.append((pid, name))
+        if targets:
+            self.last_close = self._close_batch(targets) or {}
+            self._log_close_result(self.last_close)
+        if self.manage_rtss and owned:
             self.close_rtss_family()
         self.ab_pid = None
         self.ab_by_name = False
+        self.ab_created = None
+        self.launch_at = 0.0
+        self.close_at = 0.0
         self.rtss_baseline = set()
+
+    def _log_close_result(self, results):
+        """把关闭结果按「优雅退出 / 强制结束 / 未确认」归类写一行，便于复盘。"""
+        if not results:
+            return
+        buckets = {}
+        for pid, verdict in results.items():
+            buckets.setdefault(verdict, []).append(pid)
+        parts = ['%s=%d' % (k, len(v)) for k, v in sorted(buckets.items())]
+        self.ctx.log('小飞机关闭结果：%s' % '，'.join(parts))
+        risky = buckets.get('left') or buckets.get('reused')
+        if risky:
+            self.ctx.log('有小飞机进程未被关闭（pid %s）：多为身份未确认或已在退出中，'
+                         '按"宁可不关"处理' % ', '.join(str(p) for p in risky))
 
     def _close_batch(self, targets):
         """批量关闭的唯一入口（也是回归测试的观察点）。"""
@@ -187,6 +274,16 @@ class Plugin(WingmanPlugin):
         return proc_util.close_one(self.ctx, self._core(), pid, name,
                                    self.close_wait, self.force_close)
 
+    def _rtss_new(self, pid):
+        """RTSS 目标是否"本局新出现"的：基线 pid 可能已被系统复用给新进程，
+        只有创建时刻在本局开始之后的才算我们带来的。拿不到时间时不碰。"""
+        if not self.rtss_since:
+            return True
+        created = proc_util.process_created(pid)
+        if created is None:
+            return False
+        return created >= self.rtss_since - 2.0
+
     def close_rtss_family(self):
         """先关 RTSS.exe 主进程再关子进程，多轮复核（v1 890-922 原文搬迁）。"""
         ctx = self.ctx
@@ -198,7 +295,8 @@ class Plugin(WingmanPlugin):
                 ctx.log('取进程表失败，RTSS 清理提前结束')
                 return
             new_pids = [pid for pid, name in procs.items()
-                        if name in rtss_names and pid not in self.rtss_baseline]
+                        if name in rtss_names and pid not in self.rtss_baseline
+                        and self._rtss_new(pid)]
             if not new_pids:
                 break
             # rtss.exe 排最前：它是父进程，先关掉才不会重新拉起 EncoderServer / HooksLoader
@@ -220,7 +318,8 @@ class Plugin(WingmanPlugin):
             ctx.log('取进程表失败，无法复核 RTSS 残留（已处理 %d 个）' % total)
             return
         left = sorted(n for pid, n in final.items()
-                      if n in rtss_names and pid not in self.rtss_baseline)
+                      if n in rtss_names and pid not in self.rtss_baseline
+                      and self._rtss_new(pid))
         if left:
             ctx.log('RTSS 仍有残留: %s' % ', '.join(left))
         elif total:
@@ -257,19 +356,25 @@ class Plugin(WingmanPlugin):
             return
         ctx.log('启动小飞机: %s' % path)
         self.check_exe_dir(path)
+        self.launch_at = time.time()
         try:
             p = subprocess.Popen([path], cwd=os.path.dirname(path),
                                  creationflags=core.CREATE_NO_WINDOW, close_fds=True)
             self.ab_pid = p.pid
+            self.ab_created = proc_util.process_created(p.pid)
             self.ab_by_name = False
-            ctx.log('小飞机已启动，pid=%d' % p.pid)
+            ctx.log('小飞机已启动，pid=%d%s'
+                    % (p.pid, '' if self.ab_created else '（创建时间未取到，按 pid+名字认）'))
         except OSError as e:
             if getattr(e, 'winerror', None) == 740:
                 rc = core.shell_execute_runas(path)
                 if rc and rc > 32:
                     self.ab_pid = None
+                    self.ab_created = None
                     self.ab_by_name = True
-                    ctx.log('已通过 UAC 提权启动（拿不到 pid，退出时按进程名关闭）')
+                    ctx.log('已通过 UAC 提权启动（拿不到 pid，退出时只关本次启动之后'
+                            '出现的同名进程，创建时间 %s）'
+                            % time.strftime('%H:%M:%S', time.localtime(self.launch_at)))
                 else:
                     ctx.log('提权启动失败，ShellExecute 返回 %s' % rc)
                     self.next_launch = time.time() + 60
@@ -307,3 +412,23 @@ class Plugin(WingmanPlugin):
         out.append('AB running    : %s' % (core.AB_NAME in names))
         out.append('RTSS running  : %s' % sorted(names & self._rtss_names()))
         out.append('RTSS watch    : %d' % len(self._rtss_names()))
+        owned = self.ab_pid
+        if owned is not None:
+            ident = proc_util.process_identity(owned)
+            out.append('AB owned      : pid %d created_at=%s name=%s%s'
+                       % (owned,
+                          time.strftime('%H:%M:%S', time.localtime(ident['created_at']))
+                          if ident and ident.get('created_at') else '-',
+                          (ident or {}).get('name') or '-',
+                          '' if ident else '（进程已退出）'))
+        elif self.ab_by_name:
+            out.append('AB owned      : 按名字接管（本次启动 %s 之后出现的实例）'
+                       % (time.strftime('%H:%M:%S',
+                                        time.localtime(self.launch_at))
+                          if self.launch_at else '-'))
+        else:
+            out.append('AB owned      : 无（用户自己启动 / 未接管）')
+        if self.last_close:
+            out.append('AB last close : %s'
+                       % '，'.join('%s=%s' % kv for kv in
+                                  sorted(self.last_close.items())))

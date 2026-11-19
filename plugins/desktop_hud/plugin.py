@@ -235,9 +235,17 @@ class Plugin(WingmanPlugin):
             st = self._overlay.status() if self._overlay is not None else None
             if st is not None:
                 out.append('desktop_hud worker  : running=%s paused=%s '
-                           'interval=%sms sample=%.1fms slow=%s'
-                           % (st['running'], st['paused'], st['interval_ms'],
-                              st['sample_ms'], st['slow_events']))
+                           'gen=%s state=%s interval=%sms sample=%.1fms slow=%s '
+                           'restart_pending=%s'
+                           % (st['running'], st['paused'],
+                              st.get('worker_gen'), st.get('sampler_state'),
+                              st['interval_ms'], st['sample_ms'],
+                              st['slow_events'], st.get('restart_pending')))
+                out.append('desktop_hud reading : age=%sms stale=%s gpu_reason=%s '
+                           'target=%s'
+                           % (st.get('sample_age_ms'), st.get('stale'),
+                              st.get('gpu_reason') or '-',
+                              st.get('gpu_target') or '-'))
                 for ln in st.get('backend') or ():
                     out.append('desktop_hud ' + ln)
             # --self-test 是独立进程：它自己 reload_config 才把悬浮窗建出来，

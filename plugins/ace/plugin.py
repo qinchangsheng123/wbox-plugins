@@ -16,6 +16,7 @@
 默认秒数仍来自 `core_defaults`——插件目录可被替换，闸门参数不能跟着变。
 """
 import os
+import time
 
 from core_defaults import ACE_CLEANUP_DEFAULTS, ACE_THROTTLE_DEFAULTS
 from plugin_api import WingmanPlugin
@@ -42,10 +43,18 @@ class Plugin(WingmanPlugin):
         # ---- 限速状态 ----
         self.ace_seen = {}             # pid -> 首次见到 ACE 的时刻（延迟限制用）
         self.throttled = set()         # 已被限速的 pid（退出/关开关时按它还原）
+        self.throttled_names = {}      # pid -> 进程名（还原日志要写清楚是哪几个）
         self.throttle_tried = set()    # 已成功限速的 pid
         self.throttle_retry = {}       # pid -> 下次允许重试的时刻
         self.update_block_noted = False
         self.priv_noted = False
+        # ---- v2.2.0 决策解释（审查项 4）----
+        # 每一轮判定都留一条：为什么清 / 为什么跳过、闸门当时的值、目标身份。
+        # 只保留最近 20 条并落盘，自检与诊断包直接读。
+        self.decisions = []
+        self.last_action = ''
+        self._decision_stamp = None      # (code, reason) 用于日志去重
+        self._decision_log_at = 0.0      # 上次写日志的时刻（周期性刷一条）
         # ---- 配置缓存 ----
         self.cfg = {}
         self.ac_cfg = {}
@@ -98,6 +107,109 @@ class Plugin(WingmanPlugin):
             games_present=self.ctx.games_present)
         self.cleaner._snapshot_impl = self.ctx.snapshot
         self._log_summary()
+
+    # ---------------------------------------------------------------- 决策记录
+    def _session_key(self):
+        try:
+            return int(self.ctx.session().started_at or 0)
+        except Exception:
+            return 0
+
+    def _gate_snapshot(self):
+        """本轮四道闸门的实际取值：排查"为什么没清"首先看这几个数。"""
+        ac = self.ac_cfg or {}
+        return {
+            'grace_sec': ac.get('grace_sec'),
+            'min_ace_age_sec': ac.get('min_ace_age_sec'),
+            'quiet_after_update_sec': ac.get('quiet_after_update_sec'),
+            'cooldown_sec': ac.get('cooldown_sec'),
+            'dry_run': bool(ac.get('dry_run')),
+        }
+
+    def _target_snapshot(self, procs=None):
+        """目标身份：名字 + pid + 已运行秒数 + 当前 CPU/IO（限速目标再带状态）。"""
+        if self.cleaner is None:
+            return []
+        try:
+            procs = procs if procs is not None else (self.ctx.procs() or {})
+            core = self._core()
+            out = []
+            for pid, name in self.cleaner.ace_processes(procs or {}):
+                age = None
+                try:
+                    age = self.ctx.import_core('ace_native').process_age_sec(pid)
+                except Exception:
+                    age = None
+                item = {'pid': int(pid), 'name': name,
+                        'age_sec': int(age) if age is not None else None,
+                        'throttled': int(pid) in self.throttled}
+                try:
+                    item['cpu'] = core.priority_class(pid)[1]
+                    io_now = core.io_priority(pid)
+                    item['io'] = core.IO_HINTS.get(io_now, io_now)
+                except Exception:
+                    pass
+                out.append(item)
+            return out
+        except Exception:
+            return []
+
+    def _record_decision(self, code, reason, action='', extra=None):
+        """记一条决策并（有变化时）落盘 + 写日志。
+
+        日志策略：判定码变了、真的动手了、或距上次已过 300 秒才写一行——
+        否则 COOLDOWN/GRACE 阶段每分钟一条会把 guard.log 刷满。
+        """
+        now = time.time()
+        rec = {'ts': round(now, 3), 'kind': 'cleanup', 'code': code,
+               'reason': reason, 'action': action,
+               'session': self._session_key(),
+               'gates': self._gate_snapshot(),
+               'targets': self._target_snapshot()}
+        if extra:
+            rec.update(extra)
+        self.decisions.append(rec)
+        if len(self.decisions) > 20:
+            del self.decisions[:-20]
+        stamp = (code, reason, action)
+        changed = stamp != self._decision_stamp
+        if changed:
+            self._decision_stamp = stamp
+        if changed or action or now - self._decision_log_at >= 300:
+            self._decision_log_at = now
+            self.last_action = action
+            self._log_decision(rec)
+            self._save_decisions()
+            if action or code == 'CLEAN':
+                try:
+                    self.ctx.import_core('events').emit(
+                        'ace', code=code, msg=reason, action=action,
+                        dur_ms=None)
+                except Exception:
+                    pass
+        return rec
+
+    def _log_decision(self, rec):
+        tg = rec.get('targets') or []
+        targets = ', '.join('%s#%d%s' % (
+            t.get('name'), t.get('pid'),
+            ('/%.0fs' % t['age_sec']) if t.get('age_sec') is not None else '')
+            for t in tg) or '无'
+        g = rec.get('gates') or {}
+        self.ctx.log('ACE 决策 %s：%s｜目标=%s｜闸门 grace=%s min_age=%s quiet=%s '
+                     'cooldown=%s%s%s'
+                     % (rec['code'], rec['reason'], targets,
+                        g.get('grace_sec'), g.get('min_ace_age_sec'),
+                        g.get('quiet_after_update_sec'), g.get('cooldown_sec'),
+                        '｜DryRun' if g.get('dry_run') else '',
+                        ('｜动作=%s' % rec['action']) if rec.get('action') else ''))
+
+    def _save_decisions(self):
+        try:
+            self.ctx.write_state('ace_decisions',
+                                 {'version': 1, 'items': self.decisions[-20:]})
+        except Exception as e:
+            self.ctx.log('写 ACE 决策记录失败: %r' % (e,))
 
     def _log_summary(self):
         """功能开关摘要只在真的变化时打一行（v1 571-582 的 stamp 语义）。"""
@@ -173,6 +285,8 @@ class Plugin(WingmanPlugin):
             return
         if not self.ace_touched:
             self.ctx.log('本局没有出现 ACE 进程，跳过清理调度')
+            self._record_decision('NOACE', '本局未出现 ACE 进程',
+                                  extra={'phase': 'queue'})
             return
         self.ace_pending = True
         self.ace_exit_at = now
@@ -207,17 +321,24 @@ class Plugin(WingmanPlugin):
             self.ctx.log('ACE 判定 %s：%s' % (code, reason))
             self.ace_verdict = code
         if code == 'CLEAN':
+            before = self._target_snapshot(procs)
+            ok = False
             try:
-                self.cleaner.run_cleanup(procs)
+                ok = bool(self.cleaner.run_cleanup(procs))
             except Exception as e:
                 self.ctx.log('ACE 清理异常: %r' % (e,))
+            self._record_decision('CLEAN', reason,
+                                  action='清理成功' if ok else '清理未完成',
+                                  extra={'ok': ok, 'before': before})
             self.ace_pending = False
             self.ace_verdict = ''
             return
         if code == 'NOACE':
+            self._record_decision('NOACE', reason, action='结束排队')
             self.ace_pending = False
             self.ace_verdict = ''
             return
+        self._record_decision(code, reason)
         self.ace_next_check = now + float(ac.get('eval_interval_sec', 60))
 
     # ---------------------------------------------------------------- 限速
@@ -260,6 +381,30 @@ class Plugin(WingmanPlugin):
             self._rebuild_caches()
         return self._targets
 
+    def _restore_all(self, core):
+        """还原全部被限速的 ACE，逐个记结果（谁成功、谁失败、错误码）。"""
+        done = []
+        failed = []
+        for pid in list(self.throttled):
+            name = self.throttled_names.get(pid) or '?'
+            try:
+                ok = core.restore_process(pid)
+            except Exception as e:
+                failed.append('%s#%d(%r)' % (name, pid, e))
+                continue
+            if ok is False:
+                failed.append('%s#%d(读回不符)' % (name, pid))
+            else:
+                done.append('%s#%d' % (name, pid))
+        self.throttled.clear()
+        self.throttled_names.clear()
+        if done:
+            self.ctx.log('还原明细：%s' % ', '.join(done))
+        if failed:
+            self.ctx.log('还原失败 %d 个：%s（进程可能已退出或权限不足）'
+                         % (len(failed), '，'.join(failed)))
+        return len(done)
+
     def tick_throttle(self, now, procs, names=None):
         """游戏期间把 ACE 的 I/O 与 CPU 优先级压到最低（v1 1005-1089 原文搬迁）。
 
@@ -270,10 +415,7 @@ class Plugin(WingmanPlugin):
         th = self.throttle_cfg()
         if not th.get('enabled'):
             if self.throttled:
-                done = len(self.throttled)
-                for pid in list(self.throttled):
-                    core.restore_process(pid)
-                self.throttled.clear()
+                done = self._restore_all(core)
                 self.restore_noted = True
                 self.ctx.log('ACE 限速已关闭，已还原 %d 个进程的优先级' % done)
             self.ace_seen.clear()
@@ -286,10 +428,7 @@ class Plugin(WingmanPlugin):
         # v1 的条件是 `not session and pending_stop is None`，在 v2 就是 state == 'idle'。
         if self.ctx.session().state == 'idle':
             if self.throttled:
-                done = len(self.throttled)
-                for pid in list(self.throttled):
-                    core.restore_process(pid)
-                self.throttled.clear()
+                done = self._restore_all(core)
                 self.restore_noted = True   # 本局已结算，下一轮别再补"无需还原"
                 self.ctx.log('游戏已退出，已还原 %d 个 ACE 进程的优先级' % done)
             elif self.ace_touched and not self.restore_noted:
@@ -326,6 +465,8 @@ class Plugin(WingmanPlugin):
         for pid in [p for p in self.throttle_retry if p not in procs]:
             self.throttle_retry.pop(pid, None)
         self.throttled &= set(procs)
+        self.throttled_names = dict((p, n) for p, n in self.throttled_names.items()
+                                    if p in self.throttled)
 
         targets = self.throttle_targets()
         delay = float(th.get('delay_sec', 20))
@@ -352,6 +493,7 @@ class Plugin(WingmanPlugin):
                 self.throttle_tried.add(pid)
                 self.throttle_retry.pop(pid, None)
                 self.throttled.add(pid)
+                self.throttled_names[pid] = name
                 _, shown = core.priority_class(pid)
                 io_now = core.io_priority(pid)
                 self.ctx.log('ACE 限速: %s (pid %d) → %s（读回 CPU=%s，磁盘IO=%s）' %
@@ -383,9 +525,27 @@ class Plugin(WingmanPlugin):
         out.append('ACE services  : %s' %
                    (self.cleaner.services_running() if self.cleaner else 'n/a'))
         targets = self.throttle_targets()
+        preview = self._target_snapshot(procs)
+        if preview:
+            out.append('ACE 目标预览   : %s' % '; '.join(
+                '%s#%d age=%ss %s/%s%s'
+                % (t['name'], t['pid'],
+                   t.get('age_sec') if t.get('age_sec') is not None else '?',
+                   t.get('cpu') or '?', t.get('io') or '?',
+                   ' 已限速' if t.get('throttled') else '')
+                for t in preview))
+        else:
+            out.append('ACE 目标预览   : 当前没有匹配的 ACE 进程')
         for pid, name in sorted(procs.items(), key=lambda kv: kv[1]):
             if name in targets:
                 io_now = core.io_priority(pid)
                 out.append('   throttled   : %s (pid %d) CPU=%s IO=%s'
                            % (name, pid, core.priority_class(pid)[1],
                               core.IO_HINTS.get(io_now, io_now)))
+        if self.decisions:
+            last = self.decisions[-1]
+            out.append('ACE 最近决策   : %s｜%s｜动作=%s｜%s'
+                       % (last.get('code'), last.get('reason'),
+                          last.get('action') or '无',
+                          time.strftime('%H:%M:%S',
+                                        time.localtime(last.get('ts') or 0))))

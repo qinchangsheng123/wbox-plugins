@@ -1,7 +1,7 @@
 {
   "id": "popup",
   "name": "弹窗拦截",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "api": 1,
   "icon": "block",
   "order": 30,
@@ -52,6 +52,12 @@
       "type": "bool",
       "label": "记录所有新窗口",
       "hint": "排查漏拦时打开，平时关着以免记录过多"
+    },
+    {
+      "key": "popup_guard.observe_only",
+      "type": "bool",
+      "label": "观察模式",
+      "hint": "只记录本应关闭的窗口和进程，不动手；怀疑误拦时先开一轮"
     }
   ]
 }

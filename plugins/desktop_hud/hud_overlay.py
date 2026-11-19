@@ -258,7 +258,6 @@ class HudOverlay(object):
         self._wndproc_cb = None
         self._class_name = None
         self._font = None
-        self._sampler = None
         self._sample = {}
         self._lines = []
         self._w = 120
@@ -286,6 +285,16 @@ class HudOverlay(object):
         self._worker_stop = None
         self._pending_sampler_cfg = None
         self._menu_adapters = []
+        # v1.6.1 采样器所有权：Sampler 由**采样线程自己**创建与关闭，窗口线程
+        # 与后续新建的线程都不再共享任何 PDH/ADL 句柄。这样即使旧线程卡在
+        # 驱动调用里没能退出，新线程拿着的是另一套句柄，不会出现两条线程
+        # 同时读同一个 PDH 查询的未定义行为。
+        self._worker_gen = 0            # 采样线程代号（每起一条 +1）
+        self._sampler_state = 'idle'    # idle / running / stopped / orphan
+        self._restart_pending = False   # 想恢复采样，但旧线程还没退出
+        self._sample_at = 0.0           # 最近一次成功采样的墙钟
+        self._sample_meta = {}          # GPU 缺失原因等（采样线程发布，只读）
+        self._backend_lines = []        # 采样线程发布的分项诊断（窗口线程只读）
 
     # ------------------------------------------------------ 对外控制（守护线程）
     def start(self, prefs=None, visible=True, timeout=1.5):
@@ -406,8 +415,9 @@ class HudOverlay(object):
                 visible = self._visible
             # 采样器构造是纯 Python 对象、不加载 DLL；第一帧采样（PDH 开查询
             # + ADL 初始化，本机实测 384ms）交给采样线程，建窗路径不再等它。
-            self._sampler = hud_metrics.Sampler(
-                enable_gpu_clock=bool(prefs.get('show_gpu_freq')))
+            # v1.6.1：Sampler 不再在这里创建，改由采样线程自己持有（见
+            # _sample_loop）——窗口线程一旦持有它，恢复监控时新线程就会和
+            # 卡在驱动调用里的旧线程共用同一组句柄。
             if not self._create_window():
                 self._created.set()
                 return
@@ -434,27 +444,49 @@ class HudOverlay(object):
             self._pending_sampler_cfg = None
         return cfg
 
-    def _start_worker(self):
-        """起采样线程（幂等）。Sampler 只归这条线程所有，窗口线程不碰它。"""
+    def _sampler_cfg(self):
+        """当前偏好的采样器参数（采样线程首次启动时用）。"""
         with self._lock:
-            running = (self._worker is not None and self._worker.is_alive()
-                       and self._worker_stop is not None
-                       and not self._worker_stop.is_set())
-            if running:
-                return
+            prefs = dict(self._prefs)
+        return {'gpu_clock': bool(prefs.get('show_gpu_freq')),
+                'gpu_select': prefs.get('gpu_select') or 'auto',
+                'gpu_luid': prefs.get('gpu_luid') or ''}
+
+    def _start_worker(self, cfg=None):
+        """起采样线程（幂等）。返回是否真的起了新线程。
+
+        铁律：**旧线程还活着就绝不起第二条**。旧线程可能正卡在 PDH/ADL 的
+        原生调用里，它手里的采样器仍是活的；此时再起一条，两条线程会同时
+        读同一组句柄（v1.6.0 的重入风险）。这种情况下只登记「待恢复」，
+        由 _on_refresh（守护每轮都会推一次偏好）重试。
+        """
+        if cfg is None:
+            cfg = self._sampler_cfg()   # 先取，别在持锁时再进 _lock（会自锁）
+        with self._lock:
+            old = self._worker
+            if old is not None and old.is_alive():
+                self._restart_pending = True
+                self._pending_sampler_cfg = cfg
+                return False
             stop_ev = threading.Event()
             self._worker_stop = stop_ev
-            t = threading.Thread(target=self._sample_loop, args=(stop_ev,),
-                                 name='hud-sampler')
+            self._worker_gen += 1
+            gen = self._worker_gen
+            self._sampler_state = 'running'
+            self._restart_pending = False
+            t = threading.Thread(target=self._sample_loop,
+                                 args=(stop_ev, gen, cfg),
+                                 name='hud-sampler-%d' % gen)
             t.daemon = True
             self._worker = t
         t.start()
+        return True
 
     def _stop_worker(self, timeout=0.8):
         """请求采样线程退出，返回是否真的退出了。
 
-        原生调用卡住时 join 会超时：此时**不要** close 采样器（它可能还在
-        用 PDH/ADL 句柄），宁可留一个 daemon 线程随进程退出。
+        原生调用卡住时 join 会超时：此时把状态标成 orphan 并**保留线程引用**，
+        采样器归那条线程所有，随进程回收；绝不在窗口线程里 close 它。
         """
         with self._lock:
             ev = self._worker_stop
@@ -464,46 +496,114 @@ class HudOverlay(object):
             ev.set()
         if t is not None:
             t.join(timeout)
-        return not (t is not None and t.is_alive())
+            if t.is_alive():
+                with self._lock:
+                    self._sampler_state = 'orphan'
+                return False
+        with self._lock:
+            if not (self._worker is not None and self._worker.is_alive()):
+                self._sampler_state = 'stopped'
+        return True
 
-    def _sample_loop(self, stop_ev):
-        if self._sampler is None:
+    def _make_sampler(self, cfg):
+        """采样器工厂：**只允许采样线程调用**（测试可替换它注入替身）。"""
+        return hud_metrics.Sampler(
+            enable_gpu_clock=bool((cfg or {}).get('gpu_clock')))
+
+    def _sample_loop(self, stop_ev, gen, init_cfg):
+        """采样线程主体：Sampler 由本线程创建、使用、关闭，不与其他线程共享。"""
+        sampler = None
+        try:
+            sampler = self._make_sampler(init_cfg)
+        except Exception as e:
+            self._emit('log', msg='采样器创建失败: %r' % (e,))
+            with self._lock:
+                if self._worker_gen == gen:
+                    self._sampler_state = 'failed'
             return
-        while not stop_ev.is_set():
-            cfg = self._take_sampler_cfg()
-            if cfg is not None:
-                # 偏好里的采样器参数只在采样线程里应用：无锁竞争，也不会
-                # 让窗口线程等一次原生调用
-                try:
-                    self._sampler.set_gpu_clock_enabled(cfg['gpu_clock'])
-                    self._sampler.set_gpu_target(cfg['gpu_select'],
-                                                 cfg['gpu_luid'])
-                except Exception as e:
-                    self._emit('log', msg='应用采样配置失败: %r' % (e,))
-            t0 = time.perf_counter()
-            try:
-                snap = self._sampler.sample()
-            except Exception as e:
-                snap = {}
-                self._emit('log', msg='采样异常: %r' % (e,))
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            with self._sample_lock:
-                self._sample = snap or {}
-                self._sample_ms = dt_ms
-            backoff = self._note_sample_cost(dt_ms)
-            hwnd = self._hwnd
-            if hwnd:
-                try:
-                    self._u.PostMessageW(hwnd, WM_APP_SAMPLE, 0, 0)
-                except Exception:
-                    pass
-            # 等下一拍：200ms 粒度检查停止请求与节拍改动
-            deadline = time.monotonic() + self._interval / 1000.0 + backoff
+        applied = init_cfg
+        tick = 0
+        try:
             while not stop_ev.is_set():
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                stop_ev.wait(min(left, 0.2))
+                cfg = self._take_sampler_cfg()
+                if cfg is None:
+                    cfg = applied if applied is not None else {}
+                applied = None
+                if cfg:
+                    # 偏好里的采样器参数只在采样线程里应用：无锁竞争，也不会
+                    # 让窗口线程等一次原生调用
+                    try:
+                        sampler.set_gpu_clock_enabled(cfg['gpu_clock'])
+                        sampler.set_gpu_target(cfg['gpu_select'],
+                                               cfg['gpu_luid'])
+                    except Exception as e:
+                        self._emit('log', msg='应用采样配置失败: %r' % (e,))
+                t0 = time.perf_counter()
+                try:
+                    snap = sampler.sample()
+                except Exception as e:
+                    snap = {}
+                    self._emit('log', msg='采样异常: %r' % (e,))
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                meta = self._gpu_meta(sampler, snap)
+                with self._sample_lock:
+                    self._sample = snap or {}
+                    self._sample_ms = dt_ms
+                    self._sample_at = time.time()
+                    self._sample_meta = meta
+                # 分项诊断每 15 拍发布一次（也给窗口线程的菜单/诊断用），
+                # 避免每拍都去拼字符串、读 PDH 状态。
+                tick += 1
+                if tick % 15 == 1:
+                    try:
+                        with self._sample_lock:
+                            self._backend_lines = list(sampler.diagnostics())
+                            self._menu_adapters = list(sampler.adapters(ttl=30.0)[:8])
+                    except Exception:
+                        pass
+                backoff = self._note_sample_cost(dt_ms)
+                hwnd = self._hwnd
+                if hwnd:
+                    try:
+                        self._u.PostMessageW(hwnd, WM_APP_SAMPLE, 0, 0)
+                    except Exception:
+                        pass
+                # 等下一拍：200ms 粒度检查停止请求与节拍改动
+                deadline = time.monotonic() + self._interval / 1000.0 + backoff
+                while not stop_ev.is_set():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    stop_ev.wait(min(left, 0.2))
+        finally:
+            # 只有拥有它的线程能关闭它：这条路一定在原生调用返回之后才走到。
+            try:
+                sampler.close()
+            except Exception:
+                pass
+            with self._lock:
+                if self._worker_gen == gen:
+                    if self._sampler_state != 'orphan':
+                        self._sampler_state = 'stopped'
+
+    def _gpu_meta(self, sampler, snap):
+        """GPU 没数据时给出人话原因，区分「没目标卡 / 计数器不可用 / 还没数据」。"""
+        meta = {'reason': '', 'target': '', 'target_name': ''}
+        try:
+            st = sampler.pdh.status()
+            meta['target'] = st.get('target') or ''
+            meta['target_name'] = st.get('target_name') or ''
+            meta['error'] = st.get('error') or ''
+            if snap.get('gpu') is None:
+                if not st.get('ok'):
+                    meta['reason'] = 'no-ctr'     # 驱动计数器不可用
+                elif not st.get('target'):
+                    meta['reason'] = 'no-target'  # 目标卡缺失
+                else:
+                    meta['reason'] = 'wait'       # 有目标但这一拍没采到
+        except Exception:
+            pass
+        return meta
 
     def _note_sample_cost(self, dt_ms):
         """慢采样退避，返回本轮额外等待的秒数（上限 5s）。
@@ -735,6 +835,10 @@ class HudOverlay(object):
     def _teardown(self):
         u, g = self._u, self._g
         joined = self._stop_worker(timeout=1.0)
+        if not joined:
+            # 采样线程还卡在原生调用里：它手里的采样器/句柄不能碰，线程是
+            # daemon，随进程回收。这里只留一条线索，方便事后对照日志。
+            self._emit('log', msg='采样线程未在 1s 内退出（随进程回收，采样器归该线程所有）')
         try:
             if self._font:
                 g.DeleteObject(self._font)
@@ -748,17 +852,6 @@ class HudOverlay(object):
         self._font_key = None
         self._measure_key = None
         self._last_pos = None
-        try:
-            if self._sampler is not None:
-                if joined:
-                    self._sampler.close()
-                    self._sampler = None
-                else:
-                    # 采样线程还卡在原生调用里：句柄可能正被它使用，
-                    # 不能 close（宁可泄漏，daemon 线程随进程回收）
-                    self._emit('log', msg='采样线程未在 1s 内退出，跳过关闭采样器')
-        except Exception:
-            pass
         try:
             if self._class_name:
                 u.UnregisterClassW.argtypes = [wt.LPCWSTR, wt.HINSTANCE]
@@ -826,6 +919,11 @@ class HudOverlay(object):
             self._apply_paused(pa)
         if v is not None:
             self._apply_visible(v)
+        # 待恢复的采样：旧线程退出后才能起新的。每轮 WM_APP_REFRESH（守护每个
+        # tick 都会推偏好）重试一次，所以卡顿一结束就自动恢复，不用重启插件。
+        if self._restart_pending and not self._paused and not self._stopping:
+            if self._start_worker(self._sampler_cfg()):
+                self._emit('log', msg='旧采样线程已退出，采样已恢复')
 
     def _apply_paused(self, paused):
         if paused == self._paused:
@@ -835,10 +933,15 @@ class HudOverlay(object):
             if paused:
                 self._stop_worker()       # 游戏里停采样：只停采样线程，窗口由 hide 管
             else:
-                # 恢复：立即起采样线程，第一个读数由它异步补上（窗口线程不等）
-                self._start_worker()
+                # 恢复：立即起采样线程，第一个读数由它异步补上（窗口线程不等）。
+                # 旧线程若还卡在驱动调用里，_start_worker 只登记待恢复，绝不
+                # 起第二条线程去共用它的 PDH/ADL 句柄。
+                if not self._start_worker(self._sampler_cfg()):
+                    self._emit('log', msg='旧采样线程仍在驱动调用中，暂缓恢复采样'
+                                          '（退出后自动重试）')
                 self._relayout()
-                self._u.InvalidateRect(self._hwnd, None, True)
+                if self._hwnd:
+                    self._u.InvalidateRect(self._hwnd, None, True)
         except Exception:
             pass
 
@@ -1035,7 +1138,14 @@ class HudOverlay(object):
             lines.append(('CPU', pct(s.get('cpu')) + extra, s.get('cpu')))
         if p.get('show_gpu'):
             extra = ('  ' + ghz(s.get('gpu_mhz'))) if p.get('show_gpu_freq') else ''
-            lines.append(('GPU', pct(s.get('gpu')) + extra, s.get('gpu')))
+            val = pct(s.get('gpu'))
+            if s.get('gpu') is None:
+                # 没读数时别只留一个「-」：区分目标卡缺失 / 计数器不可用 /
+                # 尚未采到，用户一眼能判断是硬件环境还是时序问题。
+                tag = (self._sample_meta or {}).get('reason') or ''
+                if tag:
+                    val = val + ' ' + tag
+            lines.append(('GPU', val + extra, s.get('gpu')))
         if p.get('show_vram'):
             u_, t_ = gb(s.get('vram_used')), gb(s.get('vram_total'))
             detail = '%s/%sG' % ('%.1f' % u_ if u_ is not None else '-',
@@ -1282,10 +1392,10 @@ class HudOverlay(object):
             # v1.6.0：目标显卡子菜单（枚举结果按显存降序，最多 8 张）
             mode = p.get('gpu_select') or 'auto'
             luid = p.get('gpu_luid') or ''
-            try:
-                ads = self._sampler.adapters(ttl=0.0) if self._sampler else []
-            except Exception:
-                ads = []
+            # 适配器清单由采样线程发布（DxgiAdapters 归它所有）；窗口线程只读
+            # 缓存，避免在 UI 线程里再碰一次 DXGI/PDH 的原生调用。
+            with self._sample_lock:
+                ads = list(self._menu_adapters)
             self._menu_adapters = list(ads[:8])
             sub = u.CreatePopupMenu()
             if sub:
@@ -1396,23 +1506,36 @@ class HudOverlay(object):
 
     # ------------------------------------------------------ 诊断（v1.6.0）
     def _diagnostics_lines(self):
-        """分项状态：右键「诊断信息写入日志」与 --self-test 共用一份口径。"""
+        """分项状态：右键「诊断信息写入日志」与 --self-test 共用一份口径。
+
+        只读采样线程发布的结果，不在窗口线程里再调一次 PDH/ADL —— 那会变成
+        「第二条线程碰同一组句柄」，正是 v1.6.1 要消除的重入。
+        """
         with self._sample_lock:
             sample_ms = self._sample_ms
+            meta = dict(self._sample_meta or {})
+            backend = list(self._backend_lines)
+            sample_at = self._sample_at
+            gen = self._worker_gen
+            state = self._sampler_state
+        age = (time.time() - sample_at) if sample_at else -1.0
         lines = [
-            'hud running=%s paused=%s worker=%s interval=%dms sample_ms=%.1f '
-            'slow=%d'
+            'hud running=%s paused=%s worker=%s gen=%d state=%s interval=%dms '
+            'sample_ms=%.1f slow=%d stale=%s restart_pending=%s'
             % (self.is_running(), self._paused,
                bool(self._worker is not None and self._worker.is_alive()),
-               self._interval, sample_ms, self._slow_events),
+               gen, state, self._interval, sample_ms, self._slow_events,
+               ('%.1fs' % age) if age >= 0 else 'n/a', self._restart_pending),
         ]
-        try:
-            if self._sampler is not None:
-                lines.extend(self._sampler.diagnostics())
-            else:
-                lines.append('sampler=none（悬浮窗未运行）')
-        except Exception as e:
-            lines.append('diagnostics 失败: %r' % (e,))
+        if meta.get('reason'):
+            lines.append('hud gpu_reason=%s target=%s(%s) err=%s'
+                         % (meta.get('reason'), meta.get('target') or '-',
+                            meta.get('target_name') or '-',
+                            meta.get('error') or 'none'))
+        if backend:
+            lines.extend(backend)
+        elif state != 'running':
+            lines.append('sampler=%s（采样线程未运行）' % state)
         return lines
 
     def status(self):
@@ -1420,6 +1543,12 @@ class HudOverlay(object):
         with self._sample_lock:
             sample = dict(self._sample or {})
             sample_ms = self._sample_ms
+            sample_at = self._sample_at
+            meta = dict(self._sample_meta or {})
+            state = self._sampler_state
+            gen = self._worker_gen
+        age_ms = int((time.time() - sample_at) * 1000) if sample_at else -1
+        stale_after = max(3000, int(self._interval) * 3)
         return {
             'running': self.is_running(),
             'paused': self._paused,
@@ -1428,6 +1557,13 @@ class HudOverlay(object):
             'slow_events': self._slow_events,
             'worker_alive': bool(self._worker is not None
                                  and self._worker.is_alive()),
+            'worker_gen': gen,
+            'sampler_state': state,
+            'restart_pending': self._restart_pending,
+            'sample_age_ms': age_ms,
+            'stale': bool(age_ms < 0 or age_ms > stale_after),
+            'gpu_reason': meta.get('reason') or '',
+            'gpu_target': meta.get('target_name') or meta.get('target') or '',
             'show_paused': bool(self._paused),
             'sample': sample,
             'backend': self._diagnostics_lines(),

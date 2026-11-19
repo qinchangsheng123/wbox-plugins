@@ -41,6 +41,7 @@ class Plugin(WingmanPlugin):
         self.guard = None
         self.cfg = {}
         self.protect = []
+        self._record_seq = 0
 
     # ---------------------------------------------------------------- 配置
     def on_config(self, cfg):
@@ -93,9 +94,11 @@ class Plugin(WingmanPlugin):
         if stamp == getattr(self, '_stamp', None):
             return
         self._stamp = stamp
-        self.ctx.log('弹窗拦截：%s（会话中窗口提前拦截 %s；退出即清宿主进程树，'
+        self.ctx.log('弹窗拦截：%s%s（会话中窗口提前拦截 %s；退出即清宿主进程树，'
                      '之后 %d 秒内新窗口也拦；宿主 %s；会话轮询 %ss）' %
                      ('开启' if pg_cfg.get('enabled') else '关闭',
+                      '（观察模式：只记录不关闭）'
+                      if pg_cfg.get('observe_only') else '',
                       '开' if pg_cfg.get('early_close_enabled') else '关',
                       int(pg_cfg.get('watch_sec', 90)),
                       ','.join(pg_cfg.get('process_names') or []) or '未配置',
@@ -164,6 +167,18 @@ class Plugin(WingmanPlugin):
             self.guard.tick(tick.now, procs)
         except Exception as e:
             self.ctx.log('弹窗监视异常: %r' % (e,))
+        # v2.1.0：把最近动作落盘（观察模式 / 关闭记录），供面板与诊断包读取。
+        # 只在真的新增记录时写，避免每 tick 一次 IO。
+        try:
+            if getattr(self.guard, 'record_seq', 0) != self._record_seq:
+                self._record_seq = self.guard.record_seq
+                self.ctx.write_state('popup_recent', {
+                    'version': 1,
+                    'observe_only': bool(self.guard.observe_only),
+                    'items': list(self.guard.records)[-20:],
+                })
+        except Exception as e:
+            self.ctx.log('写弹窗动作记录失败: %r' % (e,))
 
     # ---------------------------------------------------------------- 自检
     def on_self_test(self, out):
@@ -178,3 +193,15 @@ class Plugin(WingmanPlugin):
                     bool(pg_cfg.get('kill_tree', True)),
                     ','.join(pg_cfg.get('process_names') or []) or '无',
                     ','.join(pg_cfg.get('path_hints') or []) or '不限'))
+        names = [n.lower() for n in (pg_cfg.get('protect_names') or [])]
+        out.append('弹窗观察模式   : %s（只记录不关闭）'
+                   % bool(pg_cfg.get('observe_only', False)))
+        out.append('弹窗保护名单   : %d 项%s'
+                   % (len(names), '（含 qq/微信/TIM 常驻）'
+                      if any(n in names for n in ('qq.exe', 'weixin.exe',
+                                                  'wechat.exe')) else '（缺少常驻项，请检查）'))
+        if getattr(self.guard, 'records', None):
+            out.append('弹窗最近动作   : %s' % '; '.join(
+                '%s %s#%s %r' % (r.get('action'), r.get('exe'), r.get('pid'),
+                                 r.get('title') or '')
+                for r in self.guard.records[-3:]))
