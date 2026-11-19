@@ -7,17 +7,22 @@ tkinter 不在其中；且 tkinter 主循环必须独占线程、与守护的单
 自带消息循环 + WM_TIMER 采样，守护线程只通过 PostMessage 投递控制指令，
 绝不阻塞在原生调用上。
 
-线程模型：
-  守护线程                         悬浮窗线程
-  --------                         ----------
-  start()  ──spawn──────────────►  _run(): 建窗口/字体/定时器 → 消息循环
-  set_prefs(p) ─lock+PostMessage─►  WM_APP_REFRESH: 应用偏好/重排/重绘
-  set_visible(v) ─lock+Post─────►  WM_APP_REFRESH: ShowWindow
-  stop()   ──PostMessage(WM_CLOSE)► DestroyWindow → WM_DESTROY → PostQuitMessage
-  on_tick(): request_q.get_nowait() ◄── 菜单/拖动把变更塞进队列（线程安全）
+线程模型（v1.6.0 起三段）：
+  守护线程                          悬浮窗线程                     采样线程
+  --------                          ----------                     ----------
+  start()  ──spawn────────────────►  _run(): 建窗口/字体 → 消息循环
+  set_prefs(p) ─lock+PostMessage──►  WM_APP_REFRESH: 应用偏好/重排/重绘
+  set_visible(v) ─lock+Post───────►  WM_APP_REFRESH: ShowWindow
+  stop()   ──PostMessage(WM_CLOSE)►  DestroyWindow → WM_DESTROY → PostQuit
+                                     WM_APP_SAMPLE ◄──PostMessage── 采样线程
+  on_tick(): 请求队列 ◄── 菜单/拖动把变更塞进队列（线程安全）
 
-采样在悬浮窗线程的 WM_TIMER 里做（PDH/ADL 都不占用守护节拍）。所有原生调用
-失败一律降级，绝不把异常抛回消息循环导致窗口线程崩溃。
+采样**不在**窗口线程里做：PDH / ADL 在驱动更新、睡眠恢复、GPU 计数器提供者
+重启时都可能卡住几百毫秒甚至数秒，落在 WM_TIMER 里就是窗口一起冻结（重绘、
+右键菜单、拖动全部卡死；本机 2026-11-19 17:56 的日志里就出现过一次
+「悬浮窗创建失败（桌面会话不可用？）」，2 秒后才建好——首帧采样建 PDH 查询
+的成本压在了建窗路径上）。v1.6.0 把采样搬到独立线程：窗口线程只读最近一次
+快照并重绘，采样变慢时按 2 倍耗时退避（上限 5s）并把慢事件写进日志。
 
 桌面常驻（desktop_only，v1.2.0）：窗口挂为桌面壁纸层 WorkerW 的子窗
 （Rainmeter / Wallpaper Engine 同款做法）——高于壁纸、低于一切应用窗口，
@@ -26,6 +31,7 @@ Win+D 不会最小化它；层级本身保证「不遮挡应用」。关闭则�
 import ctypes
 import os
 import threading
+import time
 from ctypes import wintypes as wt
 
 try:                       # 作为包模块被宿主 import
@@ -61,6 +67,7 @@ WM_EXITSIZEMOVE = 0x0232
 WM_NULL = 0x0000
 WM_APP = 0x8000
 WM_APP_REFRESH = WM_APP + 1
+WM_APP_SAMPLE = WM_APP + 2
 HTCAPTION = 2
 
 SW_HIDE = 0
@@ -98,6 +105,7 @@ MF_STRING = 0x0
 MF_CHECKED = 0x8
 MF_UNCHECKED = 0x0
 MF_SEPARATOR = 0x800
+MF_POPUP = 0x10
 TPM_RIGHTBUTTON = 0x2
 TPM_RETURNCMD = 0x100
 
@@ -122,6 +130,10 @@ M_POS_BL = 1023
 M_OPENCFG = 1030
 M_RESET = 1031
 M_CLOSE = 1032
+M_DIAG = 1033
+M_GPU_AUTO = 1040
+M_GPU_LOAD = 1041
+M_GPU_BASE = 1050          # + 适配器下标（最多 8 张）
 
 DEFAULT_PREFS = {
     'show_cpu': True,
@@ -138,10 +150,41 @@ DEFAULT_PREFS = {
     'x': 0,
     'y': 0,
     'opacity': 215,            # 0..255
-    'refresh_sec': 1.0,
+    'refresh_ms': 1000,        # 采样/重绘节拍（200..10000）
     'font_size': 14,           # 96dpi 下的像素高度
     'margin': 16,
+    # v1.6.0：阈值与精度可配（原来 70 / 90 与整数百分比是写死的）
+    'warn_percent': 70,
+    'high_percent': 90,
+    'pct_decimals': 0,         # 0 / 1
+    # v1.6.0：目标显卡选择（auto 显存最大 / load 占用最大 / luid 指定）
+    'gpu_select': 'auto',
+    'gpu_luid': '',
 }
+
+
+def _interval_ms(prefs):
+    """刷新节拍（毫秒），钳到 200..10000。refresh_sec 由 plugin.py 迁移。"""
+    try:
+        ms = int(prefs.get('refresh_ms', 1000))
+    except (TypeError, ValueError):
+        ms = 1000
+    return max(200, min(10000, ms))
+
+
+def _pct_num(prefs, key, default):
+    try:
+        return max(1, min(100, int(prefs.get(key, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pct_int(v):
+    """宽松整数：设置面板存进来可能是字符串 / 布尔 / 浮点。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
 
 _BG = 0x00141418               # COLORREF = 0x00BBGGRR -> RGB(24,20,20)
 _FG = 0x00E6E6EB               # RGB(235,230,230)
@@ -203,7 +246,7 @@ class HudOverlay(object):
         self._pending_visible = None
         self._pending_paused = None
         self._paused = False
-        self._timer_ms = 0          # 已装载的采样节拍，避免重复 SetTimer 重置计时
+        self._interval = 1000       # 采样节拍（毫秒），由 _apply_prefs 更新
         self._last_prefs_req = None  # 上次收到的偏好请求，用于去重（守护每 tick 都调）
         self._visible = True
         self._shown = False
@@ -233,7 +276,16 @@ class HudOverlay(object):
         self._u = None
         self._g = None
         self._k = None
-        self._timer_id = 1
+        # ---- v1.6.0 采样线程（窗口线程只读快照，绝不自己采样）----
+        self._sample_lock = threading.Lock()
+        self._sample_ms = 0.0       # 最近一次采样耗时（诊断 / 退避判据）
+        self._slow_events = 0
+        self._last_slow_ms = None
+        self._last_slow_log = 0.0
+        self._worker = None
+        self._worker_stop = None
+        self._pending_sampler_cfg = None
+        self._menu_adapters = []
 
     # ------------------------------------------------------ 对外控制（守护线程）
     def start(self, prefs=None, visible=True, timeout=1.5):
@@ -283,6 +335,7 @@ class HudOverlay(object):
                     except Exception:
                         pass
                 t.join(0.3)
+        self._stop_worker(timeout=0.5)     # 窗口线程可能已随 WM_DESTROY 退出
         with self._lock:
             self._hwnd = None
         self._thread = None
@@ -296,7 +349,7 @@ class HudOverlay(object):
             new = dict(prefs or {})
             hwnd = self._hwnd
             # 守护每个 tick 都会推一次偏好；内容没变就不投递，否则 _apply_prefs
-            # 会反复 SetTimer 把采样计时一直重置，refresh_sec 失效甚至完全停摆。
+            # 会反复整窗重排（连带 SetWindowPos / 字体重建），纯属浪费。
             if hwnd and new == self._last_prefs_req:
                 return
             self._pending_prefs = new
@@ -319,7 +372,8 @@ class HudOverlay(object):
                 pass
 
     def set_paused(self, paused):
-        """游戏会话停采样（交给别的监控软件）；恢复时立即补一次采样。"""
+        """游戏会话停采样（交给别的监控软件）。停 = 停采样线程，窗口另由
+        set_visible 管；恢复 = 重启采样线程，第一个读数异步补上。"""
         with self._lock:
             self._pending_paused = bool(paused)
             hwnd = self._hwnd
@@ -350,6 +404,8 @@ class HudOverlay(object):
             with self._lock:
                 prefs = dict(self._prefs)
                 visible = self._visible
+            # 采样器构造是纯 Python 对象、不加载 DLL；第一帧采样（PDH 开查询
+            # + ADL 初始化，本机实测 384ms）交给采样线程，建窗路径不再等它。
             self._sampler = hud_metrics.Sampler(
                 enable_gpu_clock=bool(prefs.get('show_gpu_freq')))
             if not self._create_window():
@@ -360,12 +416,9 @@ class HudOverlay(object):
                 self._created.set()
                 return
             self._apply_prefs(prefs, initial=True)
-            self._sample = self._sampler.sample()
-            self._relayout()
+            self._relayout()          # 先画一帧占位，数值等采样线程补上
             self._apply_visible(visible)
-            interval = max(200, int(float(prefs.get('refresh_sec', 1.0)) * 1000))
-            self._u.SetTimer(self._hwnd, self._timer_id, interval, None)
-            self._timer_ms = interval
+            self._start_worker()
             self._created.set()
             self._message_loop()
         except Exception as e:
@@ -373,6 +426,110 @@ class HudOverlay(object):
             self._created.set()
         finally:
             self._teardown()
+
+    # ------------------------------------------------------ 采样线程（v1.6.0）
+    def _take_sampler_cfg(self):
+        with self._lock:
+            cfg = self._pending_sampler_cfg
+            self._pending_sampler_cfg = None
+        return cfg
+
+    def _start_worker(self):
+        """起采样线程（幂等）。Sampler 只归这条线程所有，窗口线程不碰它。"""
+        with self._lock:
+            running = (self._worker is not None and self._worker.is_alive()
+                       and self._worker_stop is not None
+                       and not self._worker_stop.is_set())
+            if running:
+                return
+            stop_ev = threading.Event()
+            self._worker_stop = stop_ev
+            t = threading.Thread(target=self._sample_loop, args=(stop_ev,),
+                                 name='hud-sampler')
+            t.daemon = True
+            self._worker = t
+        t.start()
+
+    def _stop_worker(self, timeout=0.8):
+        """请求采样线程退出，返回是否真的退出了。
+
+        原生调用卡住时 join 会超时：此时**不要** close 采样器（它可能还在
+        用 PDH/ADL 句柄），宁可留一个 daemon 线程随进程退出。
+        """
+        with self._lock:
+            ev = self._worker_stop
+            self._worker_stop = None
+            t = self._worker
+        if ev is not None:
+            ev.set()
+        if t is not None:
+            t.join(timeout)
+        return not (t is not None and t.is_alive())
+
+    def _sample_loop(self, stop_ev):
+        if self._sampler is None:
+            return
+        while not stop_ev.is_set():
+            cfg = self._take_sampler_cfg()
+            if cfg is not None:
+                # 偏好里的采样器参数只在采样线程里应用：无锁竞争，也不会
+                # 让窗口线程等一次原生调用
+                try:
+                    self._sampler.set_gpu_clock_enabled(cfg['gpu_clock'])
+                    self._sampler.set_gpu_target(cfg['gpu_select'],
+                                                 cfg['gpu_luid'])
+                except Exception as e:
+                    self._emit('log', msg='应用采样配置失败: %r' % (e,))
+            t0 = time.perf_counter()
+            try:
+                snap = self._sampler.sample()
+            except Exception as e:
+                snap = {}
+                self._emit('log', msg='采样异常: %r' % (e,))
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            with self._sample_lock:
+                self._sample = snap or {}
+                self._sample_ms = dt_ms
+            backoff = self._note_sample_cost(dt_ms)
+            hwnd = self._hwnd
+            if hwnd:
+                try:
+                    self._u.PostMessageW(hwnd, WM_APP_SAMPLE, 0, 0)
+                except Exception:
+                    pass
+            # 等下一拍：200ms 粒度检查停止请求与节拍改动
+            deadline = time.monotonic() + self._interval / 1000.0 + backoff
+            while not stop_ev.is_set():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                stop_ev.wait(min(left, 0.2))
+
+    def _note_sample_cost(self, dt_ms):
+        """慢采样退避，返回本轮额外等待的秒数（上限 5s）。
+
+        判据：单次耗时超过「节拍的一半且 ≥40ms」。日志 60s 去重——驱动一直
+        慢的时候不能把 guard.log 刷满。
+        """
+        interval_ms = max(200, int(self._interval))
+        slow = dt_ms > max(40.0, interval_ms * 0.5)
+        now = time.time()
+        if slow:
+            self._slow_events += 1
+            self._last_slow_ms = max(self._last_slow_ms or 0.0, dt_ms)
+            if now - self._last_slow_log > 60.0:
+                self._last_slow_log = now
+                self._emit('log', msg='桌面监控采样偏慢：单次 %.0fms（第 %d 次），'
+                                      '本轮退避 %.1fs'
+                           % (dt_ms, self._slow_events,
+                              min(dt_ms * 2.0 / 1000.0, 5.0)))
+            return min(dt_ms * 2.0 / 1000.0, 5.0)
+        if self._last_slow_ms is not None:
+            self._emit('log', msg='桌面监控采样恢复正常（最慢一次 %.0fms，'
+                                  '慢事件累计 %d 次）'
+                       % (self._last_slow_ms, self._slow_events))
+            self._last_slow_ms = None
+        return 0.0
 
     def _setup_api(self):
         # use_last_error=True：否则 ctypes.get_last_error() 恒 0，注册失败
@@ -577,13 +734,7 @@ class HudOverlay(object):
 
     def _teardown(self):
         u, g = self._u, self._g
-        try:
-            hwnd = self._hwnd
-            if hwnd:
-                u.KillTimer(hwnd, self._timer_id)
-                self._timer_ms = 0
-        except Exception:
-            pass
+        joined = self._stop_worker(timeout=1.0)
         try:
             if self._font:
                 g.DeleteObject(self._font)
@@ -599,8 +750,13 @@ class HudOverlay(object):
         self._last_pos = None
         try:
             if self._sampler is not None:
-                self._sampler.close()
-                self._sampler = None
+                if joined:
+                    self._sampler.close()
+                    self._sampler = None
+                else:
+                    # 采样线程还卡在原生调用里：句柄可能正被它使用，
+                    # 不能 close（宁可泄漏，daemon 线程随进程回收）
+                    self._emit('log', msg='采样线程未在 1s 内退出，跳过关闭采样器')
         except Exception:
             pass
         try:
@@ -627,9 +783,8 @@ class HudOverlay(object):
             if msg == WM_PAINT:
                 self._paint(hwnd)
                 return 0
-            if msg == WM_TIMER:
-                if wp == self._timer_id:
-                    self._on_timer()
+            if msg == WM_APP_SAMPLE:
+                self._on_sample()
                 return 0
             if msg == WM_APP_REFRESH:
                 self._on_refresh()
@@ -678,15 +833,10 @@ class HudOverlay(object):
         self._paused = paused
         try:
             if paused:
-                self._u.KillTimer(self._hwnd, self._timer_id)
-                self._timer_ms = 0
+                self._stop_worker()       # 游戏里停采样：只停采样线程，窗口由 hide 管
             else:
-                interval = max(200, int(float(
-                    self._prefs.get('refresh_sec', 1.0)) * 1000))
-                self._u.SetTimer(self._hwnd, self._timer_id, interval, None)
-                self._timer_ms = interval
-                if self._sampler is not None:
-                    self._sample = self._sampler.sample()
+                # 恢复：立即起采样线程，第一个读数由它异步补上（窗口线程不等）
+                self._start_worker()
                 self._relayout()
                 self._u.InvalidateRect(self._hwnd, None, True)
         except Exception:
@@ -696,13 +846,14 @@ class HudOverlay(object):
         with self._lock:
             self._prefs.update(p)
             prefs = dict(self._prefs)
-        # GPU 频率开关 -> 采样器后端
-        try:
-            if self._sampler is not None:
-                self._sampler.set_gpu_clock_enabled(
-                    bool(prefs.get('show_gpu_freq')))
-        except Exception:
-            pass
+        self._interval = _interval_ms(prefs)
+        # 采样器参数不在窗口线程执行：投给采样线程，下一拍生效
+        with self._lock:
+            self._pending_sampler_cfg = {
+                'gpu_clock': bool(prefs.get('show_gpu_freq')),
+                'gpu_select': prefs.get('gpu_select') or 'auto',
+                'gpu_luid': prefs.get('gpu_luid') or '',
+            }
         self._apply_style(prefs)
         self._sync_parent(bool(prefs.get('desktop_only')))
         self._make_font(prefs)
@@ -712,15 +863,6 @@ class HudOverlay(object):
                 LWA_ALPHA)
         except Exception:
             pass
-        if not initial:
-            interval = max(200, int(float(prefs.get('refresh_sec', 1.0)) * 1000))
-            if interval != self._timer_ms:
-                # 只在节拍真变化时重装：SetTimer 同 id 会重置计时
-                try:
-                    self._u.SetTimer(self._hwnd, self._timer_id, interval, None)
-                    self._timer_ms = interval
-                except Exception:
-                    pass
         self._relayout()
         self._update_visibility()
 
@@ -852,18 +994,17 @@ class HudOverlay(object):
             self._measure_key = None
 
     # ------------------------------------------------------ 采样 / 布局 / 绘制
-    def _on_timer(self):
+    def _on_sample(self):
+        """采样线程送来的新读数：只做布局 + 重绘，窗口线程绝不再采样。"""
         if self._paused:
             return
-        self._update_visibility()
-        try:
-            if self._sampler is not None:
-                self._sample = self._sampler.sample()
-        except Exception:
-            self._sample = {}
+        with self._sample_lock:
+            snapshot = self._sample
+        self._sample = snapshot
         self._relayout()
         try:
-            self._u.InvalidateRect(self._hwnd, None, True)
+            if self._shown:
+                self._u.InvalidateRect(self._hwnd, None, True)
         except Exception:
             pass
 
@@ -872,8 +1013,16 @@ class HudOverlay(object):
         s = self._sample or {}
         lines = []
 
+        # v1.6.0：精度可配（0/1 位小数）。关掉小数时保持原来的定宽写法，
+        # 文本长度只取决于位数，_relayout 的等宽缓存才有意义。
+        dec = 1 if _pct_int(p.get('pct_decimals', 0)) else 0
+
         def pct(v):
-            return '%3d%%' % int(round(v)) if v is not None else '  -'
+            if v is None:
+                return '  -'
+            if dec:
+                return '%5.1f%%' % v
+            return '%3d%%' % int(round(v))
 
         def ghz(mhz):
             return '%.1fG' % (mhz / 1000.0) if mhz else '-'
@@ -975,6 +1124,15 @@ class HudOverlay(object):
             pass
         return 0, 0, 1920, 1080
 
+    def _virtual_screen(self):
+        """四个角围出的虚拟屏（全部显示器）。拿不到就返回 None（不启用回收）。"""
+        try:
+            u = self._u
+            return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),   # X / Y
+                    u.GetSystemMetrics(78), u.GetSystemMetrics(79))   # CX / CY
+        except Exception:
+            return None
+
     def _reposition(self):
         p = self._prefs
         hwnd = self._hwnd
@@ -985,6 +1143,22 @@ class HudOverlay(object):
         pos = p.get('position', 'top-right')
         if pos == 'custom':
             x, y = int(p.get('x', 0)), int(p.get('y', 0))
+            # v1.6.0：显示器布局变过（拔副屏 / 改分辨率）之后，存下来的自定义坐标
+            # 可能整块落在屏外，用户看到的就是「悬浮窗不见了」。这里回收到右上角。
+            vs = self._virtual_screen()
+            if vs:
+                vx, vy, vw, vh = vs
+                if (x + self._w <= vx or x >= vx + vw
+                        or y + self._h <= vy or y >= vy + vh):
+                    if not getattr(self, '_pos_clamp_logged', False):
+                        self._pos_clamp_logged = True
+                        self._emit('log', msg=(
+                            '自定义坐标 (%s,%s) 在可见屏幕之外，已回收到右上角'
+                            '（显示器布局变化后会出现这种情况）'
+                            % (p.get('x'), p.get('y'))))
+                    x, y = right - self._w - m, top + m
+                    # 顺手把内存里的坐标改成回收后的值，免得每拍都判一次屏外
+                    p['x'], p['y'] = x, y
         elif pos == 'top-left':
             x, y = left + m, top + m
         elif pos == 'bottom-right':
@@ -1031,6 +1205,9 @@ class HudOverlay(object):
             pad = getattr(self, '_pad', 8)
             line_h = getattr(self, '_line_h', 20)
             label_w = getattr(self, '_label_w', 40)
+            # v1.6.0：阈值可配（默认 70/90），保证 high 不小于 warn
+            warn = _pct_num(self._prefs, 'warn_percent', 70)
+            high = max(warn, _pct_num(self._prefs, 'high_percent', 90))
             for i, (label, val, pv) in enumerate(self._lines):
                 y = pad + i * line_h
                 # 标签暗色
@@ -1041,9 +1218,9 @@ class HudOverlay(object):
                 # 数值按占用染色
                 col = _FG
                 if pv is not None:
-                    if pv >= 90:
+                    if pv >= high:
                         col = _HIGH
-                    elif pv >= 70:
+                    elif pv >= warn:
                         col = _WARN
                 g.SetTextColor(hdc, col)
                 vr = wt.RECT(pad + label_w, y, self._w - pad, y + line_h)
@@ -1102,12 +1279,40 @@ class HudOverlay(object):
             item(M_DESKTOPONLY, '桌面常驻（不遮挡窗口）', p.get('desktop_only'))
             item(M_CLICKTHROUGH, '鼠标穿透', p.get('click_through'))
             sep()
+            # v1.6.0：目标显卡子菜单（枚举结果按显存降序，最多 8 张）
+            mode = p.get('gpu_select') or 'auto'
+            luid = p.get('gpu_luid') or ''
+            try:
+                ads = self._sampler.adapters(ttl=0.0) if self._sampler else []
+            except Exception:
+                ads = []
+            self._menu_adapters = list(ads[:8])
+            sub = u.CreatePopupMenu()
+            if sub:
+                u.AppendMenuW(sub, MF_STRING |
+                              (MF_CHECKED if mode == 'auto' else MF_UNCHECKED),
+                              M_GPU_AUTO, '自动（显存总量最大）')
+                u.AppendMenuW(sub, MF_STRING |
+                              (MF_CHECKED if mode == 'load' else MF_UNCHECKED),
+                              M_GPU_LOAD, '自动（当前占用最大）')
+                if self._menu_adapters:
+                    u.AppendMenuW(sub, MF_SEPARATOR, 0, None)
+                    for idx, a in enumerate(self._menu_adapters):
+                        label = '%s  %.1fG' % (a['name'][:26],
+                                               a['vram'] / 1073741824.0)
+                        checked = (mode == 'luid' and luid == a['luid'])
+                        u.AppendMenuW(sub, MF_STRING |
+                                      (MF_CHECKED if checked else MF_UNCHECKED),
+                                      M_GPU_BASE + idx, label)
+                u.AppendMenuW(menu, MF_POPUP | MF_STRING, sub, '目标显卡')
+            sep()
             pos = p.get('position', 'top-right')
             item(M_POS_TR, '位置：右上角', pos == 'top-right')
             item(M_POS_TL, '位置：左上角', pos == 'top-left')
             item(M_POS_BR, '位置：右下角', pos == 'bottom-right')
             item(M_POS_BL, '位置：左下角', pos == 'bottom-left')
             sep()
+            u.AppendMenuW(menu, MF_STRING, M_DIAG, '诊断信息写入日志')
             u.AppendMenuW(menu, MF_STRING, M_OPENCFG, '打开配置文件')
             u.AppendMenuW(menu, MF_STRING, M_RESET, '恢复默认')
             u.AppendMenuW(menu, MF_STRING, M_CLOSE, '关闭悬浮窗')
@@ -1146,6 +1351,20 @@ class HudOverlay(object):
                 p['desktop_only'] = not p.get('desktop_only')
             elif cmd == M_CLICKTHROUGH:
                 p['click_through'] = not p.get('click_through')
+            elif cmd == M_GPU_AUTO:
+                p['gpu_select'] = 'auto'
+                p['gpu_luid'] = ''
+            elif cmd == M_GPU_LOAD:
+                p['gpu_select'] = 'load'
+                p['gpu_luid'] = ''
+            elif M_GPU_BASE <= cmd < M_GPU_BASE + 8:
+                idx = cmd - M_GPU_BASE
+                ads = self._menu_adapters
+                if 0 <= idx < len(ads):
+                    p['gpu_select'] = 'luid'
+                    p['gpu_luid'] = ads[idx]['luid']
+                else:
+                    return          # 菜单快照过期（换过卡），什么都不改
             elif cmd in (M_POS_TR, M_POS_TL, M_POS_BR, M_POS_BL):
                 p['position'] = {M_POS_TR: 'top-right', M_POS_TL: 'top-left',
                                  M_POS_BR: 'bottom-right',
@@ -1153,12 +1372,18 @@ class HudOverlay(object):
             elif cmd == M_RESET:
                 p.clear()
                 p.update(DEFAULT_PREFS)
+            elif cmd == M_DIAG:
+                special = 'diag'
             elif cmd == M_OPENCFG:
                 special = 'open_config'
             elif cmd == M_CLOSE:
                 special = 'close'
             prefs = dict(p)
         # 锁外再做 Win32 / 回传：_apply_visible 等会再次取锁，锁内调用会死锁
+        if special == 'diag':
+            # 诊断只写日志，不改偏好：直接把分项状态交给插件落 guard.log
+            self._emit('log', msg=' | '.join(self._diagnostics_lines()))
+            return
         if special == 'open_config':
             self._emit('open_config', prefs=prefs)
             return
@@ -1168,6 +1393,45 @@ class HudOverlay(object):
             return
         self._apply_prefs(prefs)
         self._emit('prefs', prefs=prefs)
+
+    # ------------------------------------------------------ 诊断（v1.6.0）
+    def _diagnostics_lines(self):
+        """分项状态：右键「诊断信息写入日志」与 --self-test 共用一份口径。"""
+        with self._sample_lock:
+            sample_ms = self._sample_ms
+        lines = [
+            'hud running=%s paused=%s worker=%s interval=%dms sample_ms=%.1f '
+            'slow=%d'
+            % (self.is_running(), self._paused,
+               bool(self._worker is not None and self._worker.is_alive()),
+               self._interval, sample_ms, self._slow_events),
+        ]
+        try:
+            if self._sampler is not None:
+                lines.extend(self._sampler.diagnostics())
+            else:
+                lines.append('sampler=none（悬浮窗未运行）')
+        except Exception as e:
+            lines.append('diagnostics 失败: %r' % (e,))
+        return lines
+
+    def status(self):
+        """给插件自检用的结构化快照（不建窗口也能读）。"""
+        with self._sample_lock:
+            sample = dict(self._sample or {})
+            sample_ms = self._sample_ms
+        return {
+            'running': self.is_running(),
+            'paused': self._paused,
+            'interval_ms': self._interval,
+            'sample_ms': round(sample_ms, 2) if sample_ms else 0.0,
+            'slow_events': self._slow_events,
+            'worker_alive': bool(self._worker is not None
+                                 and self._worker.is_alive()),
+            'show_paused': bool(self._paused),
+            'sample': sample,
+            'backend': self._diagnostics_lines(),
+        }
 
 
 def g_getdpi(g, hdc):

@@ -1,7 +1,7 @@
 {
   "id": "desktop_hud",
   "name": "桌面监控",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "api": 1,
   "icon": "pulse",
   "order": 60,
@@ -102,6 +102,61 @@
           "label": "左下"
         }
       ]
+    },
+    {
+      "key": "desktop_hud.refresh_ms",
+      "type": "int",
+      "label": "刷新间隔",
+      "min": 200,
+      "max": 5000,
+      "step": 100,
+      "unit": "毫秒",
+      "hint": "采样与重绘节拍。越小越跟手、越费 CPU；1000 毫秒为默认"
+    },
+    {
+      "key": "desktop_hud.warn_percent",
+      "type": "int",
+      "label": "琥珀阈值",
+      "min": 40,
+      "max": 95,
+      "step": 5,
+      "unit": "%",
+      "hint": "占用达到该值数值转为琥珀色（默认 70）"
+    },
+    {
+      "key": "desktop_hud.high_percent",
+      "type": "int",
+      "label": "红色阈值",
+      "min": 50,
+      "max": 100,
+      "step": 5,
+      "unit": "%",
+      "hint": "占用达到该值数值转为红色（默认 90，低于琥珀阈值时按琥珀阈值算）"
+    },
+    {
+      "key": "desktop_hud.pct_decimals",
+      "type": "int",
+      "label": "百分比小数位",
+      "min": 0,
+      "max": 1,
+      "step": 1,
+      "hint": "0 = 整数（默认）；1 = 保留一位小数"
+    },
+    {
+      "key": "desktop_hud.gpu_select",
+      "type": "choice",
+      "label": "目标显卡",
+      "options": [
+        {
+          "value": "auto",
+          "label": "自动·显存最大"
+        },
+        {
+          "value": "load",
+          "label": "自动·占用最大"
+        }
+      ],
+      "hint": "多显卡机器上决定读哪张卡的占用/显存。要精确指定具体显卡，用悬浮窗右键菜单的「目标显卡」"
     }
   ]
 }

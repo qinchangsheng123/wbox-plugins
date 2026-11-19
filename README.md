@@ -15,13 +15,13 @@
 | `ace` ACE 防护 | 2.1.1 | 游戏期间压低反作弊进程的 CPU / 磁盘占用，退出后清理残留 | 是 | [zip][r-ace] |
 | `popup` 弹窗关闭 | 2.0.1 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗 | 否 | [zip][r-pop] |
 | `gamepp` 游戏加加联动 | 1.1.1 | 开游戏拉起游戏加加，退出后关闭 | 否 | [zip][r-gp] |
-| `desktop_hud` 桌面悬浮窗 | 1.5.1 | 桌面上显示帧率 / 占用等指标 | 否 | [zip][r-hud] |
+| `desktop_hud` 桌面悬浮窗 | 1.6.0 | 桌面上显示帧率 / 占用等指标 | 否 | [zip][r-hud] |
 
 [r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.1.1
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.1.1
 [r-pop]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/popup-v2.0.1
 [r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.1.1
-[r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.5.1
+[r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.6.0
 
 ## 安装
 
