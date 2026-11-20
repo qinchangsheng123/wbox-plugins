@@ -167,7 +167,7 @@
 
 ## 安装 / 卸载
 
-- 安装：面板「＋」选择 `desktop_hud-v1.6.0.zip`，或解压到 `plugins\desktop_hud\`。
+- 安装：面板「＋」选择 `desktop_hud-v1.7.0.zip`，或解压到 `plugins\desktop_hud\`。
 - 卸载：面板垃圾桶，或删除目录。卸载不影响其它插件。
 - 自检：`WBOX.exe --self-test` 会输出本插件的取数后端、目标显卡、适配器
   清单、采样线程节拍与最近错误。
