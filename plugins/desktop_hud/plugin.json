@@ -1,7 +1,7 @@
 {
   "id": "desktop_hud",
   "name": "桌面监控",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "api": 1,
   "icon": "pulse",
   "order": 60,
@@ -17,7 +17,7 @@
   "permissions": [
     "process.watch"
   ],
-  "tip": "桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用，可选频率。\n右键菜单逐项开关 / 换角 / 鼠标穿透；桌面常驻、不遮挡其他窗口，进入游戏停止监控、退出恢复。改动立即生效。",
+  "tip": "桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用，可选频率。\n右键菜单逐项开关 / 换位置（四角与四边居中）/ 鼠标穿透；桌面常驻、不遮挡其他窗口，进入游戏停止监控、退出恢复。改动立即生效。",
   "config": {
     "keys": [
       "desktop_hud_enabled",
@@ -100,6 +100,22 @@
         {
           "value": "bottom-left",
           "label": "左下"
+        },
+        {
+          "value": "top-center",
+          "label": "顶部"
+        },
+        {
+          "value": "bottom-center",
+          "label": "底部"
+        },
+        {
+          "value": "left-center",
+          "label": "左侧"
+        },
+        {
+          "value": "right-center",
+          "label": "右侧"
         }
       ]
     },

@@ -127,6 +127,10 @@ M_POS_TR = 1020
 M_POS_TL = 1021
 M_POS_BR = 1022
 M_POS_BL = 1023
+M_POS_TC = 1024
+M_POS_BC = 1025
+M_POS_LC = 1026
+M_POS_RC = 1027
 M_OPENCFG = 1030
 M_RESET = 1031
 M_CLOSE = 1032
@@ -146,7 +150,7 @@ DEFAULT_PREFS = {
     'pause_in_game': True,
     'desktop_only': True,
     'click_through': False,
-    'position': 'top-right',   # top-right/top-left/bottom-right/bottom-left/custom
+    'position': 'top-right',   # 四角 / 四边居中（*-center）/ custom
     'x': 0,
     'y': 0,
     'opacity': 215,            # 0..255
@@ -1275,6 +1279,14 @@ class HudOverlay(object):
             x, y = right - self._w - m, bottom - self._h - m
         elif pos == 'bottom-left':
             x, y = left + m, bottom - self._h - m
+        elif pos == 'top-center':
+            x, y = left + (right - left - self._w) // 2, top + m
+        elif pos == 'bottom-center':
+            x, y = left + (right - left - self._w) // 2, bottom - self._h - m
+        elif pos == 'left-center':
+            x, y = left + m, top + (bottom - top - self._h) // 2
+        elif pos == 'right-center':
+            x, y = right - self._w - m, top + (bottom - top - self._h) // 2
         else:                                   # top-right
             x, y = right - self._w - m, top + m
         if self._parent:
@@ -1421,6 +1433,10 @@ class HudOverlay(object):
             item(M_POS_TL, '位置：左上角', pos == 'top-left')
             item(M_POS_BR, '位置：右下角', pos == 'bottom-right')
             item(M_POS_BL, '位置：左下角', pos == 'bottom-left')
+            item(M_POS_TC, '位置：顶部居中', pos == 'top-center')
+            item(M_POS_BC, '位置：底部居中', pos == 'bottom-center')
+            item(M_POS_LC, '位置：左侧居中', pos == 'left-center')
+            item(M_POS_RC, '位置：右侧居中', pos == 'right-center')
             sep()
             u.AppendMenuW(menu, MF_STRING, M_DIAG, '诊断信息写入日志')
             u.AppendMenuW(menu, MF_STRING, M_OPENCFG, '打开配置文件')
@@ -1475,10 +1491,15 @@ class HudOverlay(object):
                     p['gpu_luid'] = ads[idx]['luid']
                 else:
                     return          # 菜单快照过期（换过卡），什么都不改
-            elif cmd in (M_POS_TR, M_POS_TL, M_POS_BR, M_POS_BL):
+            elif cmd in (M_POS_TR, M_POS_TL, M_POS_BR, M_POS_BL,
+                         M_POS_TC, M_POS_BC, M_POS_LC, M_POS_RC):
                 p['position'] = {M_POS_TR: 'top-right', M_POS_TL: 'top-left',
                                  M_POS_BR: 'bottom-right',
-                                 M_POS_BL: 'bottom-left'}[cmd]
+                                 M_POS_BL: 'bottom-left',
+                                 M_POS_TC: 'top-center',
+                                 M_POS_BC: 'bottom-center',
+                                 M_POS_LC: 'left-center',
+                                 M_POS_RC: 'right-center'}[cmd]
             elif cmd == M_RESET:
                 p.clear()
                 p.update(DEFAULT_PREFS)

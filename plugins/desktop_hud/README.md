@@ -40,7 +40,8 @@
 - 游戏中自动隐藏、游戏中停止监控、桌面常驻（不遮挡窗口）、鼠标穿透
 - 目标显卡：自动（显存总量最大）/ 自动（当前占用最大）/ 指定某一张卡
   （枚举出本机所有活动适配器，名称后面带显存总量）
-- 位置：右上 / 左上 / 右下 / 左下（也可直接左键拖拽到任意位置）
+- 位置：右上 / 左上 / 右下 / 左下 / 顶部居中 / 底部居中 / 左侧居中 / 右侧居中
+  （也可直接左键拖拽到任意位置）
 - 诊断信息写入日志（把采样后端分项状态、目标显卡、最近错误、采样耗时写进
   `guard.log`，一条一行）
 - 打开配置文件、恢复默认、关闭悬浮窗
@@ -60,7 +61,7 @@
     "show_cpu_freq": false, "show_gpu_freq": false,
     "hide_in_game": true, "pause_in_game": true,
     "desktop_only": true, "click_through": false,
-    "position": "top-right",          // top-right/top-left/bottom-right/bottom-left/custom
+    "position": "top-right",          // 四角(top/bottom-left/right)、四边居中(top/bottom/left/right-center)、custom
     "x": 0, "y": 0,                   // position=custom 时的坐标
     "opacity": 215,                   // 0..255
     "refresh_ms": 1000,               // 200..5000（v1.6.0 起取代 refresh_sec）
@@ -157,6 +158,12 @@
   采样线程还没跑第一拍就读 `status()`，会得到 `sample=0.0ms / collect_rc=None`
   这种看起来像「线程活着但不采样」的假象。现在遇到空读数会另起一次性采样器
   补一条真实读数（带 `note` 行标注来源）。
+
+## v1.7.0 变更（显示位置）
+
+- 显示位置新增四边居中：`top-center` / `bottom-center` / `left-center` /
+  `right-center`。面板设置与右键菜单同步多出「顶部 / 底部 / 左侧 / 右侧」
+  四项；居中按**窗口所在显示器**的工作区计算，随面板宽高变化自动保持居中。
 
 ## 安装 / 卸载
 
