@@ -4,13 +4,23 @@
 为什么不用 on_exit：WBOX 的 on_exit 只在守护自身停止（stop.flag / 热重载 /
 fatal）时发；Windows 关机时守护进程是被系统直接结束的，钩子不会触发。
 所以本插件在守护进程里起一条后台线程，创建一个隐藏顶层窗口，监听系统
-广播的关机通知：
+广播的关机通知。
 
-  WM_QUERYENDSESSION  立即返回 TRUE，不阻塞系统询问；
-  WM_ENDSESSION(TRUE) 用 ShutdownBlockReasonCreate 短暂挂起关机，
-                      后台调 SHEmptyRecycleBinW 清空回收站（无确认框 /
-                      无进度条 / 无声音），完成或超过「最长等待」后放行；
-  WM_ENDSESSION(FALSE) 关机被取消，立即放行。
+v1.1.0 两阶段清理（修复 v1.0.0 实测被系统提前杀掉的问题）：
+  阶段一 WM_QUERYENDSESSION：立即启动后台清理，并同步等待至多 4 秒
+  （低于系统 5 秒的挂起判定）。回收站不大时清理在这一阶段就完成，
+  系统拿到 TRUE 时回收站已经空了，最可靠。
+  阶段二 WM_ENDSESSION(TRUE)：若清理还没完成，创建一个**可见的**等待
+  窗口并 ShutdownBlockReasonCreate——隐藏窗口的阻止理由不会被系统
+  理会（v1.0.0 实测：通知后约 5 秒进程就被杀，清理没跑完）；可见窗口
+  会让系统显示「此应用正在阻止关机」并一直等下去。清理完成或超过
+  「最长等待」（默认 20 秒，可调 5–60 秒）后隐藏窗口、撤销阻止理由，
+  放行关机。
+  WM_ENDSESSION(FALSE)：关机被取消，立即隐藏窗口并放行。
+
+v1.1.1 去重：阶段一已经清完时阶段二不再重起一轮（以前每次关机会多闪一次
+可见等待窗口、并把「清理前 N 项」的记录覆盖成 0 项）。关机被取消后本轮记录
+作废，下一次关机重新清。
 
 注销（ENDSESSION_LOGOFF）默认不清理，可在设置里打开。
 进程关机优先级设为 0x100（低于普通应用默认的 0x280），等大多数程序
@@ -22,8 +32,7 @@ fatal）时发；Windows 关机时守护进程是被系统直接结束的，钩�
 钩子契约（规范 §5）：
   - 面板进程也会 import 本模块并调用 on_load，所以监听线程只在 on_tick
     （面板绝不调用）里惰性拉起，冷启动与热重载都覆盖；
-  - 所有可能阻塞的动作（建窗口 / 清回收站 / 等待）都在 ctx.spawn 的
-    后台线程里做，钩子本身立即返回；
+  - 建窗口 / 清回收站 / 等待都在后台线程或窗口线程里做，守护钩子不阻塞；
   - on_exit 里 PostMessage + join(1.0)，总耗时控制在 2 秒以内。
 """
 import ctypes
@@ -40,11 +49,28 @@ WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_QUERYENDSESSION = 0x0011
 WM_ENDSESSION = 0x0016
+WM_APP = 0x8000
+WM_APP_RELEASE = WM_APP + 1     # 清理完成 / 超时 / 取消 → 隐藏窗口并放行
 ENDSESSION_LOGOFF = 0x80000000
 
 SHERB_NOCONFIRMATION = 0x00000001
 SHERB_NOPROGRESSUI = 0x00000002
 SHERB_NOSOUND = 0x00000004
+
+SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
+WS_CHILD = 0x40000000
+WS_VISIBLE = 0x10000000
+SS_CENTER = 0x00000001
+COLOR_WINDOW = 5
+HWND_TOPMOST = -1
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+# 阶段一同步等待预算：必须低于系统对 QUERYENDSESSION 的挂起判定（默认 5 秒）
+QUERY_WAIT_SEC = 4.0
+# 阶段二可见等待窗口尺寸
+BLOCK_W, BLOCK_H = 420, 150
 
 # 关机顺序：数值大的先被结束。普通应用默认 0x280，取 0x100 排在它们之后。
 _SHUTDOWN_LEVEL = 0x100
@@ -176,7 +202,7 @@ class Plugin(WBOXPlugin):
         """后台线程：注册窗口类、建隐藏顶层窗口、跑消息循环。
 
         注意不能用 HWND_MESSAGE 消息窗口——它收不到 WM_ENDSESSION 这类
-        系统广播；必须是（不显示的）顶层窗口。
+        系统广播；必须是（平时不显示的）顶层窗口。
         """
         u = ctypes.windll.user32
         k = ctypes.windll.kernel32
@@ -197,6 +223,18 @@ class Plugin(WBOXPlugin):
         u.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
         u.DestroyWindow.argtypes = [wintypes.HWND]
         u.PostQuitMessage.argtypes = [ctypes.c_int]
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   wintypes.UINT]
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.GetSystemMetrics.restype = ctypes.c_int
+        u.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        u.ShutdownBlockReasonCreate.restype = wintypes.BOOL
+        u.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+        u.ShutdownBlockReasonDestroy.restype = wintypes.BOOL
         k.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
         k.GetModuleHandleW.restype = wintypes.HINSTANCE
         k.SetProcessShutdownParameters.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -208,17 +246,22 @@ class Plugin(WBOXPlugin):
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
+        wc.hbrBackground = wintypes.HBRUSH(COLOR_WINDOW + 1)
         wc.lpszClassName = cls
         if not u.RegisterClassW(ctypes.byref(wc)):
             raise RuntimeError('RegisterClassW 失败（err=%d）'
                                % ctypes.GetLastError())
         k.SetProcessShutdownParameters(_SHUTDOWN_LEVEL, 0)
-        hwnd = u.CreateWindowExW(0, cls, 'WBOX shutdown_bin watcher', 0,
+        hwnd = u.CreateWindowExW(0, cls, 'WBOX 正在清空回收站', 0,
                                  0, 0, 0, 0, None, None, hinst, None)
         if not hwnd:
             u.UnregisterClassW(cls, hinst)
             raise RuntimeError('CreateWindowExW 失败（err=%d）'
                                % ctypes.GetLastError())
+        # 等待窗口里的说明文字（子窗口随父窗口一起显示 / 隐藏）
+        u.CreateWindowExW(0, 'STATIC', '正在清空回收站，完成后自动继续关机…',
+                          WS_CHILD | WS_VISIBLE | SS_CENTER,
+                          12, 24, BLOCK_W - 24, 60, hwnd, None, hinst, None)
         self._hwnd = hwnd
         self.ctx.log('关机监听已就绪（hwnd=%s，注销%s清理）'
                      % (hwnd, '也' if self.clean_on_logoff else '不'))
@@ -238,19 +281,35 @@ class Plugin(WBOXPlugin):
         u = ctypes.windll.user32
         try:
             if msg == WM_QUERYENDSESSION:
-                return 1        # 同意关机，询问阶段绝不阻塞
+                # 阶段一：立即起清理，同步等至多 QUERY_WAIT_SEC 秒。
+                # 小回收站在这里就清完，系统拿到 TRUE 时已经干净了。
+                logoff = bool(lparam & ENDSESSION_LOGOFF)
+                if self.enabled and (self.clean_on_logoff or not logoff):
+                    evt = self._start_clean(logoff)
+                    if evt is not None:
+                        evt.wait(QUERY_WAIT_SEC)
+                return 1        # 同意关机；等待预算低于系统挂起判定
             if msg == WM_ENDSESSION:
                 if wparam:
                     logoff = bool(lparam & ENDSESSION_LOGOFF)
                     if self.enabled and (self.clean_on_logoff or not logoff):
-                        self._begin_clean(hwnd, logoff)
+                        evt = self._start_clean(logoff)   # 兜底：阶段一没起过
+                        if evt is not None and not evt.is_set():
+                            # 阶段二：还没清完 → 可见窗口 + 阻止理由，系统会等
+                            self._begin_block(hwnd, evt)
                     else:
                         self.ctx.log('收到结束会话通知（logoff=%s），按设置跳过清理'
                                      % logoff)
                 else:
-                    # 关机被取消：立即放行（清理若已在跑无法中止，只记日志）
-                    self._destroy_reason(hwnd)
+                    # 关机被取消：立即放行；本轮记录作废，下次关机重新清
+                    # （用户可能取消后又删了东西再关）。
+                    self._release_block(hwnd)
+                    with self._lock:
+                        self._clean_evt = None
                     self.ctx.log('系统关机被取消，已放行')
+                return 0
+            if msg == WM_APP_RELEASE:
+                self._release_block(hwnd)
                 return 0
             if msg == WM_CLOSE:
                 u.DestroyWindow(hwnd)
@@ -263,29 +322,49 @@ class Plugin(WBOXPlugin):
                 self.ctx.log('处理关机消息异常：%r' % (e,))
             except BaseException:
                 pass
-            if msg in (WM_QUERYENDSESSION,):
+            if msg == WM_QUERYENDSESSION:
                 return 1
-            if msg in (WM_ENDSESSION, WM_CLOSE, WM_DESTROY):
+            if msg in (WM_ENDSESSION, WM_APP_RELEASE, WM_CLOSE, WM_DESTROY):
                 return 0
         return u.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     # ---------------------------------------------------------------- 清理
-    def _begin_clean(self, hwnd, logoff):
+    def _start_clean(self, logoff):
+        """起一轮清理（同一轮关机只清一次）。返回完成事件；已清完返回 None。
+
+        v1.1.1：以前只挡「还在跑」的情况，阶段一 0.2 秒清完后阶段二会再起一轮，
+        每次关机会多闪一次可见等待窗口、多写一条 items=0 的记录，把「清理前
+        N 项」的实证覆盖掉。现在本轮已清完就直接返回 None。
+        """
         with self._lock:
-            if self._clean_evt is not None and not self._clean_evt.is_set():
-                return          # 同一轮关机的重复广播：不重复起清理
+            if self._clean_evt is not None:
+                if self._clean_evt.is_set():
+                    return None     # 本轮已清完，阶段二不必再清
+                return self._clean_evt
             evt = threading.Event()
             self._clean_evt = evt
+        self.ctx.log('收到%s通知，开始清空回收站'
+                     % ('注销' if logoff else '关机/重启'))
+        self.ctx.spawn(self._clean_worker, evt, logoff, self._hwnd,
+                       name='bin-empty')
+        return evt
+
+    def _begin_block(self, hwnd, evt):
+        """阶段二：可见等待窗口 + 阻止理由 + 超时看门狗。仅在窗口线程调用。"""
         u = ctypes.windll.user32
-        u.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
-        u.ShutdownBlockReasonCreate.restype = wintypes.BOOL
         u.ShutdownBlockReasonCreate(hwnd, 'WBOX 正在清空回收站，马上就好…')
-        self.ctx.log('收到%s通知，开始清空回收站（最长等待 %d 秒）'
-                     % ('注销' if logoff else '关机/重启', self.max_wait_sec))
-        self.ctx.spawn(self._clean_worker, evt, logoff, name='bin-empty')
+        cx = u.GetSystemMetrics(0)
+        cy = u.GetSystemMetrics(1)
+        x = max(0, (cx - BLOCK_W) // 2)
+        y = max(0, (cy - BLOCK_H) // 2)
+        u.SetWindowPos(hwnd, HWND_TOPMOST, x, y, BLOCK_W, BLOCK_H,
+                       SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        u.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        self.ctx.log('清理仍在进行，显示等待窗口并挂起关机（最长 %d 秒）'
+                     % self.max_wait_sec)
         self.ctx.spawn(self._release_worker, hwnd, evt, name='bin-release')
 
-    def _clean_worker(self, evt, logoff):
+    def _clean_worker(self, evt, logoff, hwnd):
         t0 = time.time()
         n, size = query_recycle_bin()
         hr = empty_recycle_bin()
@@ -316,6 +395,11 @@ class Plugin(WBOXPlugin):
         self._emit('CLEAN_OK' if ok else 'CLEAN_FAIL',
                    '%s items=%s bytes=%s' % (rec['trigger'], n, size), dur_ms)
         evt.set()
+        if hwnd:
+            try:
+                ctypes.windll.user32.PostMessageW(hwnd, WM_APP_RELEASE, 0, 0)
+            except BaseException:
+                pass
 
     def _release_worker(self, hwnd, evt):
         evt.wait(self.max_wait_sec)
@@ -323,13 +407,19 @@ class Plugin(WBOXPlugin):
             self.ctx.log('清理超过 %d 秒未完成，先放行关机（清理线程继续收尾）'
                          % self.max_wait_sec)
             self._emit('CLEAN_TIMEOUT', '超过最长等待，放行关机')
-        self._destroy_reason(hwnd)
-
-    def _destroy_reason(self, hwnd):
         try:
-            u = ctypes.windll.user32
-            u.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
-            u.ShutdownBlockReasonDestroy.restype = wintypes.BOOL
+            ctypes.windll.user32.PostMessageW(hwnd, WM_APP_RELEASE, 0, 0)
+        except BaseException:
+            pass
+
+    def _release_block(self, hwnd):
+        """隐藏等待窗口并撤销阻止理由。仅在窗口线程调用。"""
+        u = ctypes.windll.user32
+        try:
+            u.ShowWindow(hwnd, SW_HIDE)
+        except BaseException:
+            pass
+        try:
             u.ShutdownBlockReasonDestroy(hwnd)
         except BaseException:
             pass

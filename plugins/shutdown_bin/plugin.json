@@ -1,7 +1,7 @@
 {
   "id": "shutdown_bin",
   "name": "关机清回收站",
-  "version": "1.0.1",
+  "version": "1.1.1",
   "api": 1,
   "entry": "plugin.py:Plugin",
   "icon": "trash",
@@ -26,5 +26,5 @@
       "label": "注销时也清理", "hint": "默认只在关机 / 重启时清理" }
   ],
   "requires": [],
-  "description": "WBOX 插件：监听系统关机通知（WM_ENDSESSION），在关机 / 重启前清空回收站，完成或超时后放行关机。"
+  "description": "WBOX 插件：两阶段监听系统关机通知——WM_QUERYENDSESSION 阶段先清（至多等 4 秒），没清完则在 WM_ENDSESSION 阶段用可见等待窗口挂起关机，清完或超时后放行。"
 }
