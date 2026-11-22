@@ -36,6 +36,9 @@ class Plugin(WingmanPlugin):
         # 退出后先等这么多秒再关（0 = 立即）。给用户留出"撤销"窗口：
         # 倒计时期间重新开游戏会走 on_session_resume，关闭动作自然取消。
         'close_delay_sec': 0,
+        # 2026-11-22 v2.2.1：游戏会话中小飞机自己退出/被关时，过多久自动重开。
+        # 0 = 保持旧口径（本局不再自动拉起）。默认 30 秒，避免偶发退出后整局没有 OSD。
+        'ab_relaunch_sec': 30,
     }
 
     def __init__(self, ctx):
@@ -54,6 +57,7 @@ class Plugin(WingmanPlugin):
         self.next_launch = 0.0
         self.close_noted = False
         self.start_seq = -1          # 本局开局的 tick 序号（开局那一轮不判"中途退出"）
+        self.relaunch_at = 0.0       # 中途退出后的计划重开时刻（0 = 无待办）
         # ---- 配置缓存（on_config 里刷新）----
         self.enabled = True
         self.path = ''
@@ -62,6 +66,7 @@ class Plugin(WingmanPlugin):
         self.force_close = True
         self.close_wait = 6.0
         self.close_delay = 0.0       # >0 = 退出后先等这么多秒再关（可取消）
+        self.relaunch_sec = 30.0     # 中途退出后自动重开的等待秒数，0 = 不重开
         self.acl_checked = set()     # 已做过"目录是否对普通用户可写"检查的目录
         self._core_mod = None
 
@@ -96,6 +101,11 @@ class Plugin(WingmanPlugin):
             self.close_delay = max(0.0, min(60.0, float(cfg.get('close_delay_sec', 0))))
         except (TypeError, ValueError):
             self.close_delay = 0.0
+        try:
+            self.relaunch_sec = max(0.0, min(300.0,
+                                             float(cfg.get('ab_relaunch_sec', 30))))
+        except (TypeError, ValueError):
+            self.relaunch_sec = 30.0
 
     def on_load(self):
         # 启动时不主动探测小飞机（v1 也是等到开游戏才找）：on_load 里做只读检查没有意义
@@ -142,6 +152,7 @@ class Plugin(WingmanPlugin):
         self.rtss_baseline = rtss_pids
         self.rtss_since = tick.now
         self.close_at = 0.0
+        self.relaunch_at = 0.0
         ab_running = ab_name in names
         ours = ((self._owns_pid(procs, self.ab_pid)) or self.ab_by_name)
         if ab_running and ours:
@@ -188,17 +199,39 @@ class Plugin(WingmanPlugin):
         self.close_owned(procs)
 
     def on_tick(self, tick):
-        """会话中：本插件拉起的小飞机中途退出 → 放弃所有权，不再自动拉起（v1 1192-1195）。"""
+        """会话中：本插件拉起的小飞机中途退出 → 按配置延时自动重开。
+
+        v2.2.1 前有 "放弃所有权，本次不再自动拉起" 的旧语义；实测小飞机
+        会在游戏会话里偶发自己退出（守护日志能抓到退出，但 Windows 应用与
+        系统日志均无崩溃记录），一旦错过整局就没有 OSD。现在默认等 30 秒
+        重新拉起；ab_relaunch_sec=0 可退回旧口径。
+        """
         if tick.session.state != 'active':
             return
         if tick.seq == self.start_seq:
             return
-        if self.ab_pid is not None and self._ab_name() not in tick.names:
-            self.ctx.log('本脚本启动的小飞机中途退出，本次不再自动拉起')
+        ab_name = self._ab_name()
+        if self.relaunch_at and tick.now >= self.relaunch_at:
+            self.relaunch_at = 0.0
+            if ab_name in tick.names:
+                self.ctx.log('小飞机已自行恢复，取消本次重开')
+            elif not self.enabled:
+                self.ctx.log('小飞机联动已关闭（设置面板），取消本次重开')
+            else:
+                self.ctx.log('小飞机中途退出后的计划重开')
+                self.launch(tick.now)
+            return
+        if self.ab_pid is not None and ab_name not in tick.names:
             self.ab_pid = None
             self.ab_by_name = False
             self.ab_created = None
             self.launch_at = 0.0
+            if self.relaunch_sec > 0:
+                self.relaunch_at = tick.now + self.relaunch_sec
+                self.ctx.log('本脚本启动的小飞机中途退出，%d 秒后自动重开'
+                             % int(self.relaunch_sec))
+            else:
+                self.ctx.log('本脚本启动的小飞机中途退出，本次不再自动拉起')
 
     # ---------------------------------------------------------------- 关闭
     def close_owned(self, procs):
@@ -242,6 +275,7 @@ class Plugin(WingmanPlugin):
         self.ab_created = None
         self.launch_at = 0.0
         self.close_at = 0.0
+        self.relaunch_at = 0.0
         self.rtss_baseline = set()
 
     def _log_close_result(self, results):
@@ -331,6 +365,17 @@ class Plugin(WingmanPlugin):
         ctx = self.ctx
         core = self._core()
         path = self.path or ''
+        # 2026-11-22 修复：配置里填「安装目录」也算数。面板的路径选择器只能选文件，
+        # 但「编辑配置文件」是纯文本，用户容易把安装目录整段填进来（本次实测
+        # 填了 F:\jk\MSI Afterburner 就报「找不到小飞机主程序」）。目录存在且
+        # 底下有主程序时自动补上 exe 名，后面照旧走原来的校验与兜底。
+        if path and os.path.isdir(path):
+            cand = os.path.join(path, 'MSIAfterburner.exe')
+            if os.path.isfile(cand):
+                ctx.log('配置填的是目录，自动补上主程序名: %s' % cand)
+                path = cand
+        if path:
+            path = os.path.normpath(path)
         if not path or not os.path.isfile(path):
             # 配置里没写（或写的是别的机器上的路径）时兜底找一次
             for var in ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432'):
@@ -428,6 +473,10 @@ class Plugin(WingmanPlugin):
                           if self.launch_at else '-'))
         else:
             out.append('AB owned      : 无（用户自己启动 / 未接管）')
+        out.append('AB relaunch   : %d 秒%s' % (
+            int(self.relaunch_sec),
+            '，待重开 %s' % time.strftime('%H:%M:%S', time.localtime(self.relaunch_at))
+            if self.relaunch_at else ''))
         if self.last_close:
             out.append('AB last close : %s'
                        % '，'.join('%s=%s' % kv for kv in

@@ -1,7 +1,7 @@
 {
   "id": "afterburner",
   "name": "小飞机联动",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "api": 1,
   "icon": "plane",
   "order": 10,
@@ -27,7 +27,8 @@
       "manage_rtss",
       "force_close",
       "close_wait_sec",
-      "close_delay_sec"
+      "close_delay_sec",
+      "ab_relaunch_sec"
     ]
   },
   "description": "游戏 ↔ MSI Afterburner / RTSS 联动",
@@ -69,6 +70,16 @@
       "step": 1,
       "unit": "秒",
       "hint": "退出后先倒计时再关，期间回到游戏自动取消；0 = 立即关"
+    },
+    {
+      "key": "ab_relaunch_sec",
+      "type": "int",
+      "label": "掉线自动重开",
+      "min": 0,
+      "max": 300,
+      "step": 5,
+      "unit": "秒",
+      "hint": "游戏过程中小飞机意外退出时，等待这么久自动重开；0 = 本局不再重开"
     }
   ]
 }

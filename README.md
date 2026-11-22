@@ -12,14 +12,14 @@
 
 | 插件 | 版本 | 作用 | 需要管理员 | 下载 |
 |---|---|---|---|---|
-| `afterburner` 小飞机联动启动 | 2.2.0 | 开游戏自动拉起 MSI Afterburner / RTSS，退出后优雅关闭；可设关闭倒计时 | 否 | [zip][r-ab] |
+| `afterburner` 小飞机联动启动 | 2.2.1 | 开游戏自动拉起 MSI Afterburner / RTSS，中途意外退出会自动重开，退出后优雅关闭；可设关闭倒计时 | 否 | [zip][r-ab] |
 | `ace` ACE 防护 | 2.2.0 | 游戏期间压低反作弊进程的 CPU / 磁盘占用，退出后清理残留；判定留决策记录 | 是 | [zip][r-ace] |
 | `popup` 弹窗关闭 | 2.1.0 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗；观察模式只记录不动手 | 否 | [zip][r-pop] |
 | `gamepp` 游戏加加联动 | 1.2.0 | 开游戏拉起游戏加加，退出后关闭；可设关闭倒计时 | 否 | [zip][r-gp] |
 | `desktop_hud` 桌面悬浮窗 | 1.7.0 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率；显示位置可四边居中 | 否 | [zip][r-hud] |
 | `shutdown_bin` 关机清回收站 | 1.1.2 | 关机 / 重启前自动清空回收站（两阶段，清不完才挂起并显示等待窗口），最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
 
-[r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.0
+[r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.1
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.2.0
 [r-pop]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/popup-v2.1.0
 [r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.2.0
@@ -28,7 +28,7 @@
 
 ## 插件详解
 
-### afterburner — 小飞机联动启动（v2.2.0）
+### afterburner — 小飞机联动启动（v2.2.1）
 
 **干什么**：开游戏自动拉起 MSI Afterburner（超频 / 风扇曲线 / 硬件监控），
 连同 RTSS 帧率显示与录制组件一起管理；游戏全部退出后，把**本局拉起来的那一批**
@@ -41,10 +41,13 @@
 2. RTSS 组件按「本局起点」认领：只有本局开始**之后**创建的
    `rtss.exe` / `rtsshooksloader*` / `encoderserver*` / `desktopoverlayhost*`
    才算我们拉起的，赛前就在跑的组件不动。
-3. 游戏全部退出：先等 `close_wait_sec`（避免误伤还在收尾的程序），再正常请求退出；
+3. 游戏途中若小飞机自己退出 / 被关：默认等 `ab_relaunch_sec`（30 秒）自动重开；
+   设为 0 则保留旧行为（本局不再拉起）。重开前若它已自行恢复，或联动已关，
+   待办自动取消。配置里填安装目录也能识别（自动补 `MSIAfterburner.exe`）。
+4. 游戏全部退出：先等 `close_wait_sec`（避免误伤还在收尾的程序），再正常请求退出；
    `force_close` 开着时，没反应的才结束进程。若设了 `close_delay_sec`，
    退出后先倒计时，**期间回到游戏自动取消关闭**。
-4. 关闭前逐个复核身份：pid 会被 Windows 复用，同名进程在同一个 pid 上重新出现时，
+5. 关闭前逐个复核身份：pid 会被 Windows 复用，同名进程在同一个 pid 上重新出现时，
    创建时刻对不上就绝不关；拿不到创建时间的也一律不动（宁可不关，不能关错）。
    UAC 提权启动拿不到 pid 时按名字 + 创建时刻接管，早于本次启动的实例视为你自己的。
 
@@ -57,12 +60,13 @@
 | 关不掉时强制结束 `force_close` | 开关 | 开 | 先正常请求退出，没反应再结束进程 |
 | 退出后等待 `close_wait_sec` | 3–30 秒 | 6 | 游戏结束后等多久才开始关 |
 | 关闭倒计时 `close_delay_sec` | 0–60 秒 | 0 | 退出后先倒计时再关，回到游戏自动取消；0 = 立即 |
+| 掉线自动重开 `ab_relaunch_sec` | 0–300 秒 | 30 | 游戏途中意外退出后多久重开；0 = 本局不再重开 |
 
 **绝不做什么**：不关你自己开的小飞机 / RTSS；不改小飞机任何配置与超频参数；
 身份无法确认的进程一律不动。
 
-**排查**：`guard.log` 里看「启动小飞机」「关闭判定」逐目标结果；
-齿轮菜单「导出诊断」打包全部日志与事件。
+**排查**：`guard.log` 里看「启动小飞机」「中途退出，N 秒后自动重开」「关闭判定」逐目标结果；
+设置页「关于 → 导出诊断」打包全部日志与事件。
 
 ---
 
