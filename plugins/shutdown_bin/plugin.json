@@ -1,7 +1,7 @@
 {
   "id": "shutdown_bin",
   "name": "关机清回收站",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "api": 1,
   "entry": "plugin.py:Plugin",
   "icon": "trash",

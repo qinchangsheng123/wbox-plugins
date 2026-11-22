@@ -1,6 +1,6 @@
 # shutdown_bin —— 关机清回收站（WBOX 插件）
 
-版本 1.1.1 · API 1 · 适用 WBOX v2.13.0+（按 PLUGIN-SPEC.md 编写）
+版本 1.1.2 · API 1 · 适用 WBOX v2.13.0+（按 PLUGIN-SPEC.md 编写）
 
 ## 功能
 
@@ -16,6 +16,8 @@
 - 进程关机优先级设为 0x100（低于普通应用的 0x280），等大多数程序退完再清理。
 - 每次清理结果（时间 / 清理前项数与体积 / 耗时 / HRESULT）写入
   `plugins\shutdown_bin\data\last_clean.json`，并记入 `guard.log` 与 `events.jsonl`。
+- 回收站本来就是空的时候 `SHEmptyRecycleBinW` 返回 `0x8000FFFF`，按「无需清理」
+  记成功（v1.1.2），不再发假的 `CLEAN_FAIL`。
 
 ## 为什么不用 on_exit 钩子 / 为什么要可见等待窗口
 
@@ -40,7 +42,7 @@ v1.0.0 实测教训（2026-11-22）：只在 `WM_ENDSESSION` 阶段清理、且�
 
 ## 安装
 
-面板标题栏「＋」选择 `shutdown_bin-v1.1.1.zip`（与 `.zip.sha256` 放同一目录），
+面板标题栏「＋」选择 `shutdown_bin-v1.1.2.zip`（与 `.zip.sha256` 放同一目录），
 确认来源后安装；或直接把 `shutdown_bin\` 目录复制到安装目录 `plugins\` 下，
 再写 `plugins_reload.flag` 触发热重载。
 

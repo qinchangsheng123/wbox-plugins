@@ -17,14 +17,14 @@
 | `popup` 弹窗关闭 | 2.1.0 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗；观察模式只记录不动手 | 否 | [zip][r-pop] |
 | `gamepp` 游戏加加联动 | 1.2.0 | 开游戏拉起游戏加加，退出后关闭；可设关闭倒计时 | 否 | [zip][r-gp] |
 | `desktop_hud` 桌面悬浮窗 | 1.7.0 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率；显示位置可四边居中 | 否 | [zip][r-hud] |
-| `shutdown_bin` 关机清回收站 | 1.1.1 | 关机 / 重启前自动清空回收站（两阶段，清不完才挂起并显示等待窗口），最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
+| `shutdown_bin` 关机清回收站 | 1.1.2 | 关机 / 重启前自动清空回收站（两阶段，清不完才挂起并显示等待窗口），最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
 
 [r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.0
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.2.0
 [r-pop]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/popup-v2.1.0
 [r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.2.0
 [r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.7.0
-[r-sbin]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/shutdown_bin-v1.1.1
+[r-sbin]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/shutdown_bin-v1.1.2
 
 ## 插件详解
 
@@ -210,7 +210,7 @@
 
 悬浮窗右键菜单与面板设置等价：逐项开关 / 换角 / 穿透 / 目标显卡，改动立即生效。
 
-### shutdown_bin — 关机清回收站（v1.1.1）
+### shutdown_bin — 关机清回收站（v1.1.2）
 
 **干什么**：关机 / 重启前自动清空当前用户所有盘的回收站，无确认框、无进度条、
 无声音。注销默认不清，可在设置里打开。
@@ -226,6 +226,8 @@
   5–60 秒）后自动放行。
 - 同一轮关机只清一次：阶段一已清完时阶段二不再重起（v1.1.1），关机被取消
   则本轮记录作废，下次关机重新清。
+- 回收站本来就空时 `SHEmptyRecycleBinW` 返回 `0x8000FFFF`，按「无需清理」记
+  成功（v1.1.2），不再发假的 `CLEAN_FAIL`。
 - v1.0.0 实测教训（2026-11-22）：只在 `WM_ENDSESSION` 清理、且窗口隐藏时，
   `ShutdownBlockReasonCreate` 不被系统理会，通知后约 5 秒进程就被杀、清理没
   跑完。所以 v1.1.0 起改成两阶段 + 可见等待窗口。

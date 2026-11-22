@@ -22,6 +22,10 @@ v1.1.1 去重：阶段一已经清完时阶段二不再重起一轮（以前每�
 可见等待窗口、并把「清理前 N 项」的记录覆盖成 0 项）。关机被取消后本轮记录
 作废，下一次关机重新清。
 
+v1.1.2 空回收站不再记失败：回收站本来就空时 SHEmptyRecycleBinW 返回
+E_UNEXPECTED（0x8000FFFF），以前按 hr != 0 判失败，每次关机都记一条假失败
+并发 CLEAN_FAIL 事件。现在按「查询 0 项 + 该 HRESULT」识别为无需清理。
+
 注销（ENDSESSION_LOGOFF）默认不清理，可在设置里打开。
 进程关机优先级设为 0x100（低于普通应用默认的 0x280），等大多数程序
 退完再轮到本插件，尽量把它们在退出前删进回收站的东西一并清掉。
@@ -370,6 +374,14 @@ class Plugin(WBOXPlugin):
         hr = empty_recycle_bin()
         dur_ms = int((time.time() - t0) * 1000)
         ok = (hr == 0)
+        # 回收站本来就是空的时候 SHEmptyRecycleBinW 返回 E_UNEXPECTED
+        # （0x8000FFFF）。2026-11-22 实测：空 → 0x8000FFFF；放 1 项进去 → 0；
+        # 清空后再调 → 又回到 0x8000FFFF。这不是失败，否则每次关机都会记一条
+        # 假失败、还发一条 CLEAN_FAIL 事件。
+        empty_bin_hr = (hr & 0xFFFFFFFF) in (0x8000FFFF, 1)
+        already_empty = (n == 0 and empty_bin_hr)
+        if already_empty:
+            ok = True
         rec = {
             'at': round(time.time(), 3),
             'ok': ok,
@@ -379,6 +391,8 @@ class Plugin(WBOXPlugin):
             'dur_ms': dur_ms,
             'trigger': 'logoff' if logoff else 'shutdown',
         }
+        if already_empty:
+            rec['already_empty'] = True
         self.last_clean = rec
         try:
             self.ctx.write_state(STATE_NAME, rec)   # 动作完成立即落盘
@@ -388,9 +402,13 @@ class Plugin(WBOXPlugin):
             before = '清理前统计不可用'
         else:
             before = '清理前 %d 项 / %.1f MB' % (n, (size or 0) / 1048576.0)
-        self.ctx.log('回收站清理%s：%s，耗时 %.1f 秒（hr=0x%08X）'
-                     % ('成功' if ok else '失败', before, dur_ms / 1000.0,
-                        rec['hr']))
+        if already_empty:
+            self.ctx.log('回收站本来就是空的，无需清理（%s，hr=0x%08X）'
+                         % (before, rec['hr']))
+        else:
+            self.ctx.log('回收站清理%s：%s，耗时 %.1f 秒（hr=0x%08X）'
+                         % ('成功' if ok else '失败', before, dur_ms / 1000.0,
+                            rec['hr']))
         self.ctx.set_status(self._status_text())
         self._emit('CLEAN_OK' if ok else 'CLEAN_FAIL',
                    '%s items=%s bytes=%s' % (rec['trigger'], n, size), dur_ms)
