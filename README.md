@@ -3,7 +3,7 @@
 [WBOX](https://github.com/qinchangsheng123/wbox) 的官方插件。主程序从 **v2.11.3**
 起不再随安装包附带插件，功能全部由这里分发：装好主程序，再按需装插件。
 
-插件 API 版本 **1**。当前这批插件与 WBOX **v2.13.0** 内核配套发布
+插件 API 版本 **1**。当前这批插件与 WBOX **v2.14.1** 内核配套发布
 （ace 2.2.0 起用到内核 `events` 模块，需要 v2.13.0 及更高版本）。
 
 ## 插件清单
@@ -16,13 +16,15 @@
 | `ace` ACE 防护 | 2.2.0 | 游戏期间压低反作弊进程的 CPU / 磁盘占用，退出后清理残留；判定留决策记录 | 是 | [zip][r-ace] |
 | `popup` 弹窗关闭 | 2.1.0 | 游戏会话中关掉 ClientBrowser 广告 / 直播弹窗；观察模式只记录不动手 | 否 | [zip][r-pop] |
 | `gamepp` 游戏加加联动 | 1.2.0 | 开游戏拉起游戏加加，退出后关闭；可设关闭倒计时 | 否 | [zip][r-gp] |
-| `desktop_hud` 桌面悬浮窗 | 1.6.1 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率 | 否 | [zip][r-hud] |
+| `desktop_hud` 桌面悬浮窗 | 1.7.0 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率；显示位置可四边居中 | 否 | [zip][r-hud] |
+| `shutdown_bin` 关机清回收站 | 1.0.1 | 关机 / 重启前自动清空回收站，最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
 
 [r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.0
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.2.0
 [r-pop]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/popup-v2.1.0
 [r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.2.0
-[r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.6.1
+[r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.7.0
+[r-sbin]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/shutdown_bin-v1.0.1
 
 ## 插件详解
 
@@ -207,6 +209,35 @@
 | 显卡 | 目标显卡 | 自动·显存最大 / 自动·占用最大；精确选卡用右键菜单 |
 
 悬浮窗右键菜单与面板设置等价：逐项开关 / 换角 / 穿透 / 目标显卡，改动立即生效。
+
+### shutdown_bin — 关机清回收站（v1.0.1）
+
+**干什么**：关机 / 重启前自动清空当前用户所有盘的回收站，无确认框、无进度条、
+无声音。注销默认不清，可在设置里打开。
+
+**怎么工作**：
+
+- WBOX 的 `on_exit` 在 Windows 关机时不会触发（守护被系统直接结束），所以插件
+  在守护进程里自建隐藏顶层窗口，监听 `WM_QUERYENDSESSION` / `WM_ENDSESSION`。
+- 清空时用 `ShutdownBlockReasonCreate` 短暂挂起关机，完成或超过「最长等待」
+  （默认 20 秒，可调 5–60 秒）后放行，不会卡在关机界面。
+- 进程关机优先级设为 0x100（低于普通应用的 0x280），等大多数程序退完再清理，
+  尽量把它们退出前删进回收站的东西一并清掉。
+- 监听线程只在 `on_tick` 里惰性拉起：面板进程不调用 `on_tick`，冷启动与热重载
+  （不重发 `on_start`）两条路径都覆盖，不会误建窗口。
+- 结果写 `plugins\shutdown_bin\data\last_clean.json`，同时进 `guard.log` 与
+  `events.jsonl`（时间 / 清理前项数与体积 / 耗时 / HRESULT）。
+
+**设置项**：
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `shutdown_bin_enabled` | bool | true | 总开关，关闭后停止监听 |
+| `shutdown_bin.max_wait_sec` | int | 20 | 清理最长等待秒数（5–60），超时先放行 |
+| `shutdown_bin.clean_on_logoff` | bool | false | 注销时是否也清理 |
+
+**注意**：清空回收站是不可恢复的删除，这正是本插件的唯一用途；除回收站外
+不读写任何其它文件。只声明 `files.any` 权限，不需要管理员。
 
 ## 安装
 
