@@ -1,0 +1,73 @@
+{
+  "id": "local_ai",
+  "name": "本地 AI 按需启停",
+  "version": "1.0.4",
+  "api": 1,
+  "entry": "plugin.py:Plugin",
+  "icon": "play",
+  "order": 70,
+  "home": true,
+  "requires_admin": false,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "files.any"
+  ],
+  "toggle": [
+    "local_ai_enabled"
+  ],
+  "tip": "有本地 AI 请求时自动拉起 llama.cpp 服务，空闲一段时间后自动关闭，避免 12 GB 显存常驻。\n配套脚本 local_ai_prep.py 写请求信号；手动启动的服务不会被本插件关闭。",
+  "config": {
+    "keys": [
+      "local_ai_enabled",
+      "local_ai.exe_path",
+      "local_ai.model_path",
+      "local_ai.mmproj_path",
+      "local_ai.port",
+      "local_ai.ctx_size",
+      "local_ai.idle_timeout_sec",
+      "local_ai.startup_timeout_sec",
+      "local_ai.signal_path"
+    ]
+  },
+  "settings": [
+    {
+      "key": "local_ai_enabled",
+      "type": "bool",
+      "label": "启用本地 AI 按需启停",
+      "hint": "关闭后插件不再拉起或关闭任何服务"
+    },
+    {
+      "key": "local_ai.idle_timeout_sec",
+      "type": "int",
+      "label": "空闲多久后关闭",
+      "min": 30,
+      "max": 600,
+      "step": 30,
+      "unit": "秒",
+      "hint": "请求结束且无在处理任务后开始计时；冷启动约 40 秒，默认 120 秒避免反复启停"
+    },
+    {
+      "key": "local_ai.startup_timeout_sec",
+      "type": "int",
+      "label": "启动等待上限",
+      "min": 60,
+      "max": 300,
+      "step": 30,
+      "unit": "秒",
+      "hint": "超过这个时间模型还没就绪就判定失败并终止进程"
+    },
+    {
+      "key": "local_ai.ctx_size",
+      "type": "int",
+      "label": "启动上下文长度",
+      "min": 4096,
+      "max": 65536,
+      "step": 4096,
+      "unit": "token",
+      "hint": "摘要类任务 8192 足够，加载更快；64K 会让冷启动显著变长"
+    }
+  ],
+  "requires": [],
+  "description": "WBOX 插件：检测本地 AI 请求信号 → 拉起 llama-server → 等待就绪 → 请求消失且 /slots 全空闲后自动关闭。只关闭自己启动的进程。"
+}

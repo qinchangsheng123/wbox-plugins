@@ -19,6 +19,7 @@
 | `desktop_hud` 桌面悬浮窗 | 1.7.0 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率；显示位置可四边居中 | 否 | [zip][r-hud] |
 | `shutdown_bin` 关机清回收站 | 1.1.2 | 关机 / 重启前自动清空回收站（两阶段，清不完才挂起并显示等待窗口），最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
 | `idle_shutdown` 任务后自动关机 | 1.0.0 | 夜间等 WorkBuddy / Qoder 任务静默后关机；会话 + CPU + 键鼠三重判据，先见到任务才关；可选先关飞牛 NAS | 是 | [zip][r-isd] |
+| `local_ai` 本地 AI 按需启停 | 1.0.4 | 有本地 AI 请求才拉起 llama.cpp 服务，请求结束且空闲后自动关闭；只关自己拉起的进程，手动启动的不动 | 否 | [zip][r-lai] |
 
 [r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.1
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.2.0
@@ -27,6 +28,7 @@
 [r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.7.0
 [r-sbin]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/shutdown_bin-v1.1.2
 [r-isd]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/idle_shutdown-v1.0.0
+[r-lai]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/local_ai-v1.0.4
 
 ## 插件详解
 
@@ -267,8 +269,8 @@
 ③ 键鼠空闲。再加两道闸门：必须在 00:00–08:00（可调），且本窗口内确实见到过任务在忙。
 单轮忙不算忙，连续两轮才清零计时；探测失败一律按忙处理。
 
-**怎么关**：命中后先关飞牛 NAS（可选，调用旧脚本目录的 `nas_poweroff.py`，口令运行时从
-`secrets.local.md` 读，不进插件包），再走 `InitiateSystemShutdownExW`，失败回退
+**怎么关**：命中后先关飞牛 NAS（可选，调用旧脚本目录的 `nas_poweroff.py`，
+SSH 口令由它在运行时从本机凭证文件读取，不进插件包），再走 `InitiateSystemShutdownExW`，失败回退
 `shutdown /s /t`。倒计时用 Windows 自带窗口；写 `stop.flag` / `.cancelled`、
 在面板关掉插件、或在倒计时窗口点取消，都会调用 `AbortSystemShutdownW` 撤销，
 并用代次号拦住已排队的关机线程。
@@ -285,6 +287,38 @@
 探测与关机都在后台线程，on_tick 只做计数；窗口外、取消标记存在、
 插件被禁用三种情况下不会发起任何关机。`dry_run` 可在 `config.json` 里开，
 只记日志不真关。
+
+### local_ai — 本地 AI 按需启停（v1.0.4）
+
+**干什么**：本地 llama.cpp 冷启动约 40 秒，Q5 + 64K 上下文要占 10 GB 以上显存。
+本插件让它**只在有请求时运行**：请求结束、`/slots` 全部空闲并持续一段时间后自动关闭，
+显存还给游戏。**用户自己启动的服务不会被插件关闭**，只在面板里显示为 `external`。
+
+**触发协议**：请求方在调用模型前写 `local_ai.signal_path`（默认
+`~/.workbuddy/scripts/local_ai_request.json`）：
+
+```json
+{"action":"start","client":"local_ai_prep.py","pid":12345,"ts":1764000000}
+```
+
+插件看到文件 → 拉起 `llama-server.exe` → 轮询 `/health` 就绪 → 写同目录
+`local_ai_ready.json`（`starting` / `ready` / `error` / `stopped`）。调用方用完删掉请求文件，
+插件确认没有在处理的任务后再关。
+
+**状态机**：`idle → starting → ready → idle`；已探测到外部服务走 `external`（连续 3 次
+探测不到，约 6 秒退回 `idle`）；自己拉起的进程在 `ready` 下退出会立即清状态，
+不会让 `ready.json` 悬着。
+
+| 设置 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| 启用 | 开关 | 开 | 总开关 |
+| 空闲多久后关闭 | 整数 | 120 秒 | 请求消失且无在处理任务后计时 |
+| 启动等待上限 | 整数 | 120 秒 | 超时判定失败并终止进程 |
+| 启动上下文长度 | 整数 | 8192 | 8192 足够摘要类任务，64K 冷启动明显变长 |
+
+**路径要自己填**：`local_ai.exe_path` / `local_ai.model_path` / `local_ai.mmproj_path` /
+`local_ai.signal_path` 的默认值只是示例布局，装好后请在 `config.json` 改成自己机器上的
+llama.cpp 目录与权重文件。启动参数固定带 `--host 127.0.0.1`、`-np 1`，不会监听外网。
 
 ## 安装
 
