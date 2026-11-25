@@ -18,6 +18,7 @@
 | `gamepp` 游戏加加联动 | 1.2.0 | 开游戏拉起游戏加加，退出后关闭；可设关闭倒计时 | 否 | [zip][r-gp] |
 | `desktop_hud` 桌面悬浮窗 | 1.7.0 | 桌面半透明悬浮窗：CPU / GPU / 显存 / 内存占用与频率；显示位置可四边居中 | 否 | [zip][r-hud] |
 | `shutdown_bin` 关机清回收站 | 1.1.2 | 关机 / 重启前自动清空回收站（两阶段，清不完才挂起并显示等待窗口），最长等待可调；注销默认不清 | 否 | [zip][r-sbin] |
+| `idle_shutdown` 任务后自动关机 | 1.0.0 | 夜间等 WorkBuddy / Qoder 任务静默后关机；会话 + CPU + 键鼠三重判据，先见到任务才关；可选先关飞牛 NAS | 是 | [zip][r-isd] |
 
 [r-ab]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/afterburner-v2.2.1
 [r-ace]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/ace-v2.2.0
@@ -25,6 +26,7 @@
 [r-gp]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/gamepp-v1.2.0
 [r-hud]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/desktop_hud-v1.7.0
 [r-sbin]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/shutdown_bin-v1.1.2
+[r-isd]: https://github.com/qinchangsheng123/wbox-plugins/releases/tag/idle_shutdown-v1.0.0
 
 ## 插件详解
 
@@ -252,6 +254,37 @@
 
 **注意**：清空回收站是不可恢复的删除，这正是本插件的唯一用途；除回收站外
 不读写任何其它文件。只声明 `files.any` 权限，不需要管理员。
+
+### idle_shutdown — 任务后自动关机（v1.0.0，需要管理员）
+
+**干什么**：把本机 `shutdown_after_midnight.py` v1.3.0 搬进 WBOX。夜间任务跑完后
+不用守着屏幕，插件检测「任务真的结束了」再发起关机；原来的 `ShutdownAfterMidnight`
+计划任务可以停用，避免两套逻辑各关一次。
+
+**怎么判**：三条同时满足并持续 10 分钟（可调）——
+① `~\.workbuddy\projects` 与 `~\.qoder\projects` 下的会话 jsonl 不再写入
+（日志目录是心跳，不看）；② WorkBuddy / Qoder 进程组 CPU < 8%（没开算空闲）；
+③ 键鼠空闲。再加两道闸门：必须在 00:00–08:00（可调），且本窗口内确实见到过任务在忙。
+单轮忙不算忙，连续两轮才清零计时；探测失败一律按忙处理。
+
+**怎么关**：命中后先关飞牛 NAS（可选，调用旧脚本目录的 `nas_poweroff.py`，口令运行时从
+`secrets.local.md` 读，不进插件包），再走 `InitiateSystemShutdownExW`，失败回退
+`shutdown /s /t`。倒计时用 Windows 自带窗口；写 `stop.flag` / `.cancelled`、
+在面板关掉插件、或在倒计时窗口点取消，都会调用 `AbortSystemShutdownW` 撤销，
+并用代次号拦住已排队的关机线程。
+
+| 设置 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| 启用 | 开关 | 开 | 总开关 |
+| 时间窗 | 选择 | 夜间 00:00–08:00 | 另有晚间 20:00–23:59、全天 |
+| 静默多久后关机 | 整数 | 10 分钟 | 三项判据同时满足后计时 |
+| 关机倒计时 | 整数 | 60 秒 | Windows 倒计时，期间可取消 |
+| 必须先见到任务在跑 | 开关 | 开 | 防空窗夜误关，不建议关 |
+| 关机前先关飞牛 NAS | 开关 | 关 | 失败只记日志，不拦本机 |
+
+探测与关机都在后台线程，on_tick 只做计数；窗口外、取消标记存在、
+插件被禁用三种情况下不会发起任何关机。`dry_run` 可在 `config.json` 里开，
+只记日志不真关。
 
 ## 安装
 

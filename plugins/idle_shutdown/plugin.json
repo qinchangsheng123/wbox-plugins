@@ -1,0 +1,64 @@
+{
+  "id": "idle_shutdown",
+  "name": "任务后自动关机",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py:Plugin",
+  "icon": "moon",
+  "order": 80,
+  "home": true,
+  "requires_admin": true,
+  "publisher": "WBOX",
+  "homepage": "https://github.com/qinchangsheng123/wbox-plugins",
+  "permissions": [
+    "process.watch",
+    "files.any",
+    "shell.run",
+    "network"
+  ],
+  "toggle": ["idle_shutdown_enabled"],
+  "tip": "夜间等 WorkBuddy / Qoder 任务跑完，再自动关机；可选先关飞牛 NAS。\n默认 00:00–08:00，且必须先观察到任务在忙。倒计时用 Windows 自带窗口，可取消。",
+  "config": {
+    "keys": [
+      "idle_shutdown_enabled",
+      "idle_shutdown.window",
+      "idle_shutdown.idle_min",
+      "idle_shutdown.poll_sec",
+      "idle_shutdown.grace_sec",
+      "idle_shutdown.cpu_max",
+      "idle_shutdown.require_activity",
+      "idle_shutdown.require_idle_input",
+      "idle_shutdown.watch_workbuddy",
+      "idle_shutdown.watch_qoder",
+      "idle_shutdown.nas_shutdown",
+      "idle_shutdown.dry_run",
+      "idle_shutdown.legacy_stop_dir",
+      "idle_shutdown.nas_helper",
+      "idle_shutdown.shutdown_reason"
+    ]
+  },
+  "settings": [
+    { "key": "idle_shutdown_enabled", "type": "bool",
+      "label": "启用任务后自动关机", "hint": "关闭后不再监测，也不会发起关机" },
+    { "key": "idle_shutdown.window", "type": "choice",
+      "label": "允许关机的时间窗",
+      "options": [
+        { "value": "night", "label": "夜间 00:00–08:00" },
+        { "value": "evening", "label": "晚间 20:00–23:59" },
+        { "value": "always", "label": "全天（不推荐）" }
+      ],
+      "hint": "窗口外只待命，绝不关机" },
+    { "key": "idle_shutdown.idle_min", "type": "int",
+      "label": "静默多久后关机", "min": 5, "max": 60, "step": 5, "unit": "分钟",
+      "hint": "会话文件、进程组 CPU、键鼠三项同时空闲并持续这么久" },
+    { "key": "idle_shutdown.grace_sec", "type": "int",
+      "label": "关机倒计时", "min": 30, "max": 300, "step": 30, "unit": "秒",
+      "hint": "Windows 倒计时窗口期间可取消" },
+    { "key": "idle_shutdown.require_activity", "type": "bool",
+      "label": "必须先见到任务在跑", "hint": "防止整晚没人用机器时被误关；默认开" },
+    { "key": "idle_shutdown.nas_shutdown", "type": "bool",
+      "label": "关机前先关飞牛 NAS", "hint": "调用旧脚本目录的 nas_poweroff.py，口令不进插件包" }
+  ],
+  "requires": [],
+  "description": "把本机零点后自动关机脚本移植为 WBOX 插件：会话 jsonl 静默 + WorkBuddy/Qoder 进程组 CPU 低 + 键鼠空闲，时间窗内且确实见到过任务才关机；支持倒计时取消与飞牛 NAS 联动。"
+}
